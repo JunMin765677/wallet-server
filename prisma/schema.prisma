@@ -1,0 +1,127 @@
+// =======================
+// Prisma Client 設定
+// 產生 JS/TS 可用的 ORM Client
+// =======================
+generator client {
+  provider = "prisma-client-js"
+}
+
+// =======================
+// 資料來源：MySQL
+// DATABASE_URL 例：mysql://user:pass@host:3306/db
+// =======================
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =======================
+// Enum 區：狀態與模式（用來限制欄位值）
+// =======================
+
+// 發行交易狀態：建立中／逾時／錯誤
+enum VcTxStatus {
+  CREATED
+  EXPIRED
+  ERROR
+}
+
+// 發行模式：有個資（DATA）／無個資（NODATA）
+enum VcMode {
+  DATA
+  NODATA
+}
+
+// 憑證狀態：已發行／已撤銷
+enum VcCredStatus {
+  ISSUED
+  REVOKED
+}
+
+// 驗證請求狀態：建立中／已完成／逾時
+enum VpReqStatus {
+  CREATED
+  COMPLETED
+  TIMEOUT
+}
+
+// =======================
+// Model 區（無任何資料庫層級關聯）
+// 命名慣例：Vc* = 發行線、Vp* = 驗證線
+// 關聯主軸（僅用作字串比對）：transactionId、cid
+// =======================
+
+/// 發行交易（呼叫 /api/qrcode/(data|nodata) 會建立一筆）
+/// - 保存你送給沙盒的請求與回應（便於除錯/追溯）
+/// - **未設資料庫外鍵**：僅以 transactionId 串接應用層
+model VcTransaction {
+  id              Int           @id @default(autoincrement())
+  /// 交易序號（平台回給你的唯一識別）
+  transactionId   String        @unique @db.VarChar(64)
+  /// 模板識別（沙盒的 vcUid）
+  vcUid           String        @db.VarChar(128)
+  /// 發行模式：DATA/NODATA
+  mode            VcMode
+  /// 你送去沙盒的請求原文（含欄位值）
+  requestPayload  Json
+  /// 沙盒回的初始回應（含 qrcode / deeplink 等）
+  responsePayload Json?
+  /// 交易狀態（Created/Expired/Error）
+  status          VcTxStatus    @default(CREATED)
+  /// 建立時間
+  createdAt       DateTime      @default(now())
+}
+
+/// VC 憑證本體（拿到 credential 後建立）
+/// - rawJwt 存原始 JWT/SD-JWT
+/// - **未設資料庫外鍵**：以 transactionId 對應發行交易（應用層手動關聯）
+model VcCredential {
+  id            Int          @id @default(autoincrement())
+  /// 憑證 CID（由 credential/jti 解析而來）
+  cid           String       @unique @db.VarChar(128)
+  /// 對應的發行交易 ID（邏輯上一對一，故設為 unique）
+  transactionId String       @unique @db.VarChar(64)
+  /// 原始憑證字串（JWT/SD-JWT），為除錯與溯源所需
+  rawJwt        String       @db.LongText
+  /// 憑證狀態（ISSUED/REVOKED）
+  status        VcCredStatus @default(ISSUED)
+  /// 發證時間
+  issuedAt      DateTime     @default(now())
+  /// 撤銷時間（如已撤銷）
+  revokedAt     DateTime?
+}
+
+/// 驗證請求（呼叫 /api/oidvp/qrcode 建立）
+/// - 保存 ref 與 tx，對應前端展示的 QR 與錢包互動
+/// - **未設資料庫外鍵**：以 transactionId 對應驗證結果（應用層手動關聯）
+model VpRequest {
+  id            Int         @id @default(autoincrement())
+  /// 驗證交易序號（你自產 UUID v4）
+  transactionId String      @unique @db.VarChar(64)
+  /// 驗證服務代碼（沙盒建立的 ref）
+  ref           String      @db.VarChar(128)
+  /// 狀態（建立中/已完成/逾時）
+  status        VpReqStatus @default(CREATED)
+  /// 建立時間
+  createdAt     DateTime    @default(now())
+}
+
+/// 驗證結果（呼叫 /api/oidvp/result 成功後落地）
+/// - 保存 verifyResult / claims 與原始回傳（溯源）
+/// - **未設資料庫外鍵**：以 transactionId 對應 VpRequest；可選以 vcCredentialCid 對應 VcCredential
+model VpResult {
+  id            Int       @id @default(autoincrement())
+  /// 對應的驗證交易序號（邏輯上一對一，因此 unique）
+  transactionId String    @unique @db.VarChar(64)
+  /// 驗證是否通過
+  verifyResult  Boolean
+  /// 選擇性揭露後的欄位（claims）
+  claims        Json
+  /// 上游原始回傳（保留以便日後比對）
+  raw           Json
+  /// 收到結果的時間
+  receivedAt    DateTime  @default(now())
+
+  /// （可選）對應的憑證 CID（如要記錄「這次驗證使用哪張 VC」）
+  vcCredentialCid String? @db.VarChar(128)
+}
