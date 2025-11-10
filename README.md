@@ -1,7 +1,6 @@
 
 -----
 
-````markdown
 # 數位憑證 (VC) 模擬平台 - 後端 API
 
 這是一個基於 Node.js、Express 和 Prisma 的後端伺服器，旨在模擬數位憑證 (VC) 的生命週期，包括「簽發 (Issuance)」和「驗證 (Verification)」。
