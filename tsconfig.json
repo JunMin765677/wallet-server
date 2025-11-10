@@ -1,49 +1,27 @@
 {
-  // Visit https://aka.ms/tsconfig to read more about this file
   "compilerOptions": {
     "target": "ES2020",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
+    "module": "CommonJS",                  // <-- 正確 (您已修正)
+    "moduleResolution": "Node",           // <-- [修正 1] 必須改為 "Node"
+    
+    "strict": true,                         // <-- 總開關 (如果您真的要最寬鬆，可設為 false)
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "outDir": "dist",
-    "rootDir": "src",
-    // File Layout
-    // "rootDir": "./src",
-    // "outDir": "./dist",
+    
+    "outDir": "dist",                       // <-- 正確
+    "rootDir": ".",                         // <-- 正確 (這會讓 TS 輸出 "dist/src/...")
 
-    // Environment Settings
-    // See also https://aka.ms/tsconfig/module
-    "types": [],
-    // For nodejs:
-    // "lib": ["esnext"],
-    // "types": ["node"],
-    // and npm install -D @types/node
-
-    // Other Outputs
+    "types": ["node"],
     "sourceMap": true,
     "declaration": true,
-    "declarationMap": true,
-
-    // Stricter Typechecking Options
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-
-    // Style Options
-    // "noImplicitReturns": true,
-    // "noImplicitOverride": true,
-    // "noUnusedLocals": true,
-    // "noUnusedParameters": true,
-    // "noFallthroughCasesInSwitch": true,
-    // "noPropertyAccessFromIndexSignature": true,
-
-    // Recommended Options
-    "jsx": "react-jsx",
-    "verbatimModuleSyntax": true,
-    "isolatedModules": true,
-    "noUncheckedSideEffectImports": true,
-    "moduleDetection": "force",
+    "declarationMap": true
+    
+    // --- 已移除不必要的 ESM/Bundler 嚴格設定 ---
+    // "jsx": "react-jsx",
+    // "verbatimModuleSyntax": true,
+    // "isolatedModules": true,
+    // "noUncheckedSideEffectImports": true,
+    // "moduleDetection": "force",
   }
 }

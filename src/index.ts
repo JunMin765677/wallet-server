@@ -1,64 +1,74 @@
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import pino from 'pino'
-import { prisma } from './db'
-import issuerRouter from './routes/issuer'   // ⬅️ 新增
-import verifierRouter from './routes/verifier'
+import express from 'express';
+import session from 'express-session';
+import cors from 'cors';
+import { PrismaClient } from '@prisma/client';
 
+// [FIX 2] 修正模組匯入路徑，加上 .js 副檔名
+// 並且假設您的 tsconfig.json 會自動讀取 src/types/session.d.ts 中的型別
+import issuanceRoutes from './routes/issuance';
+import verificationRoutes from './routes/verification';
+import adminRoutes from './routes/admin';
 
-const app = express()
-const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'info' : 'debug' })
+// 初始化
+const app = express();
+export const prisma = new PrismaClient(); // 匯出 Prisma 實例供路由使用
 
-app.use(cors())
-app.use(express.json({ limit: '1mb' }))
+// [FIX 1] 將 PORT 轉換為 number
+// process.env.PORT 是字串，必須使用 parseInt 轉換
+const PORT = parseInt(process.env.PORT || '3001', 10);
 
-app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, service: 'wallet-mvp-server', time: new Date().toISOString() })
-})
+// --- 中間件 (Middleware) ---
 
-// ⬇️ 掛在 /issuer 前綴
-app.use('/issuer', issuerRouter)
-app.use('/verifier', verifierRouter)
+// 1. 啟用 CORS
+// [FIX 3] 允許來自區域網路(例如手機)的連線
+// -----------------------------------------------------------------
+// ⚠️ 重要：請將 'YOUR_COMPUTER_IP_HERE' 換成您電腦在區域網路上的 IP 位址
+// (例如 '192.168.1.10' 或 '10.0.0.5')
+// 您可以在 Windows 使用 'ipconfig' 或在 macOS/Linux 使用 'ifconfig' / 'ip addr' 查到
+const YOUR_COMPUTER_IP = '10.0.0.35'; // 根據您的 ifconfig 輸出
+// -----------------------------------------------------------------
 
-// Debug：看 DB（保留）
-app.get('/debug/db', async (_req, res) => {
-  try {
-    const [
-      vcTxs, vcCreds, vpReqs, vpResults,
-      vcTxCount, vcCredCount, vpReqCount, vpResCount
-    ] = await Promise.all([
-      prisma.vcTransaction.findMany({ orderBy: { id: 'desc' }, take: 10 }),
-      prisma.vcCredential.findMany({ orderBy: { id: 'desc' }, take: 10 }),
-      prisma.vpRequest.findMany({ orderBy: { id: 'desc' }, take: 10 }),
-      prisma.vpResult.findMany({ orderBy: { id: 'desc' }, take: 10 }),
-      prisma.vcTransaction.count(),
-      prisma.vcCredential.count(),
-      prisma.vpRequest.count(),
-      prisma.vpResult.count(),
-    ])
-    res.json({
-      summary: {
-        vc_transactions: vcTxCount,
-        vc_credentials: vcCredCount,
-        vp_requests: vpReqCount,
-        vp_results: vpResCount,
-      },
-      latest: {
-        vc_transactions: vcTxs,
-        vc_credentials: vcCreds,
-        vp_requests: vpReqs,
-        vp_results: vpResults,
-      }
-    })
-  } catch (e: any) {
-    res.status(500).json({ error: true, message: e.message })
+const allowedOrigins = [
+  'http://localhost:3000', // 允許本機開發
+  'http://10.0.0.35:3000', // 允許本機開發
+    'http://10.0.0.35', // 允許本機開發
+   'http://172.20.10.4:3000', 
+      'http://172.20.10.4', 
+];
+
+app.set('trust proxy', 1);
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true // 允許攜帶 cookie (session)
+}));
+
+// 2. 解析 JSON Body
+app.use(express.json());
+
+// 3. 設定 Express Session
+app.use(session({
+  secret: 'your-very-secret-key-change-this', // 請替換成一個安全的密鑰
+  resave: false,
+  saveUninitialized: true, // 允許儲存新的 session
+  cookie: {
+    secure: process.env.NODE_ENV === 'production', // 生產環境中應為 true (https)
+    httpOnly: true,
+    maxAge: 1000 * 60 * 30 // Session 存活 30 分鐘
   }
-})
+}));
 
-app.use((_req, res) => res.status(404).json({ error: 'Not Found' }))
+// --- 路由 (Routes) ---
 
-const port = Number(process.env.PORT || 8001)
-app.listen(port, () => {
-  logger.info(`Server listening on http://localhost:${port}`)
-})
+// 將所有 /api/issuance 的請求導向到 issuanceRoutes
+app.use('/api/issuance', issuanceRoutes);
+app.use('/api/verification', verificationRoutes);
+app.use('/api/v1/admin', adminRoutes);
+
+// --- 啟動伺服器 ---
+
+// [FIX 2] 監聽 0.0.0.0
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Express 伺服器已啟動於 http://0.0.0.0:${PORT}`);
+  console.log(`   (本機也可透過 http://localhost:${PORT} 存取)`);
+});

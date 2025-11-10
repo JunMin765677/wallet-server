@@ -1,127 +1,233 @@
-// =======================
-// Prisma Client 設定
-// 產生 JS/TS 可用的 ORM Client
-// =======================
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// 1. 定義 Prisma 客戶端生成器 (for Express/Node.js)
 generator client {
   provider = "prisma-client-js"
 }
 
-// =======================
-// 資料來源：MySQL
-// DATABASE_URL 例：mysql://user:pass@host:3306/db
-// =======================
+// 2. 定義資料庫連線 (請將 "postgresql" 換成您的資料庫，例如 mysql 或 sqlite)
 datasource db {
   provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
-// =======================
-// Enum 區：狀態與模式（用來限制欄位值）
-// =======================
+// -------------------------------------------------
+// 核心表 (Tables)
+// -------------------------------------------------
 
-// 發行交易狀態：建立中／逾時／錯誤
-enum VcTxStatus {
-  CREATED
-  EXPIRED
-  ERROR
+/// 1. VCTemplates - VC 模板表
+model VCTemplate {
+  id              Int                 @id @default(autoincrement())
+  templateName    String              @db.VarChar(100)
+  vcUid           String?             @db.VarChar(255)
+  description     String?             @db.Text
+  cardImageUrl    String?             @db.VarChar(255)
+  createdAt       DateTime            @default(now())
+  
+  // 關聯
+  eligibilities   PersonEligibility[] // (1-M) 關聯至 PersonEligibilities
+  issuedVCs       IssuedVC[]          // (1-M) 關聯至 IssuedVCs
 }
 
-// 發行模式：有個資（DATA）／無個資（NODATA）
-enum VcMode {
-  DATA
-  NODATA
+/// 2. Persons - 使用者資料總表
+model Person {
+  id                      BigInt              @id @default(autoincrement())
+  personalId              String              @unique @db.VarChar(255) // 建立索引 (unique)
+  
+  // [⭐️ 變更 ⭐️] nationalId (移除 hash) (設為 ? 可選，解決 migrate 錯誤)
+  nationalId              String?             @db.VarChar(255) 
+  
+  name                    String              @db.VarChar(255)
+  county                  String?             @db.VarChar(50)
+  district                String?             @db.VarChar(50)
+  address                 String?             @db.VarChar(500)
+  phoneNumber             String?             @db.VarChar(20)
+  dateOfBirth             DateTime?           @db.Date
+  
+  // 新增緊急聯絡人相關欄位
+  emergencyContactName        String?             @db.VarChar(255) // 緊急聯絡人
+  emergencyContactRelationship String?            @db.VarChar(100) // 緊急聯絡人親屬關係
+  emergencyContactPhone   String?             @db.VarChar(20)    // (此欄位本來就存在)
+
+  // 新增審核相關欄位
+  reviewingAuthority          String?             @db.VarChar(255) // 審核機關
+  reviewerName                String?             @db.VarChar(255) // 審核人員
+  reviewerPhone               String?             @db.VarChar(50)  // 審核人員電話
+
+  // 新增資格效期
+  eligibilityStartDate        DateTime?           @db.Date // 資格的有效期限起始日
+  eligibilityEndDate          DateTime?           @db.Date // 資格的有效期限到期日
+
+  // 新增福利資格與財產欄位 (使用 BigInt 容納大數值，並設為 nullable)
+  // [⭐️ 變更 ⭐️] 移除 benefitLevel
+  personalAnnualIncome        BigInt?             // 個人年所得
+  personalMovableAssets       BigInt?             // 個人動產總額
+  personalRealEstateAssets    BigInt?             // 個人不動產總額
+  familyAnnualIncome          BigInt?             // 家庭成員年所得
+  familyMovableAssets         BigInt?             // 家庭成員動產總額
+  familyRealEstateAssets      BigInt?             // 家庭成員不動產總額
+  
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+  
+  // 關聯
+  eligibilities           PersonEligibility[] // (1-M) 關聯至 PersonEligibilities
+  issuedVCs               IssuedVC[]          // (1-M) 關聯至 IssuedVCs
+  verificationLogs        VerificationLog[]   // (1-M) 關聯至 VerificationLog
 }
 
-// 憑證狀態：已發行／已撤銷
-enum VcCredStatus {
-  ISSUED
-  REVOKED
+/// 3. PersonEligibilities - 模擬使用者資格表 (M2M 關聯表)
+model PersonEligibility {
+  id          BigInt      @id @default(autoincrement())
+  
+  // 關聯欄位
+  personId    BigInt
+  templateId  Int
+  
+  // 關聯定義
+  person      Person      @relation(fields: [personId], references: [id])
+  template    VCTemplate  @relation(fields: [templateId], references: [id])
+  
+  createdAt   DateTime    @default(now())
+
+  // 確保同一個使用者對同一個模板只有一筆資格紀錄
+  @@unique([personId, templateId])
 }
 
-// 驗證請求狀態：建立中／已完成／逾時
-enum VpReqStatus {
-  CREATED
-  COMPLETED
-  TIMEOUT
+/// 4. IssuedVCs - 已簽發 VC 紀錄表
+model IssuedVC {
+  id          BigInt        @id @default(autoincrement())
+  systemUuid  String        @unique @db.VarChar(255) // 我們系統的 UUID，用於驗證追蹤
+  cid         String?       @db.VarChar(255)         // Sandbox 提供的 VC 唯一 ID (來自 JTI)
+  issuedData  Json          // 簽發時存入卡面的資料
+  
+  // [⭐️ 變更 ⭐️] 新增福利資格等級 (文字)
+  benefitLevel String?      @db.VarChar(100)
+  
+  status      IssuanceStatus // 使用 Enum (見下方定義)
+  issuedAt    DateTime?     // 實際簽發日期
+  expiredAt   DateTime?     // 過期日期
+  createdAt   DateTime      @default(now())
+  
+  // 關聯欄位
+  personId    BigInt
+  templateId  Int
+  
+  // 關聯定義
+  person      Person        @relation(fields: [personId], references: [id])
+  template    VCTemplate    @relation(fields: [templateId], references: [id])
+  
+  // 關聯 (1-M)
+  issuanceLogs      IssuanceLog[]
 }
 
-// =======================
-// Model 區（無任何資料庫層級關聯）
-// 命名慣例：Vc* = 發行線、Vp* = 驗證線
-// 關聯主軸（僅用作字串比對）：transactionId、cid
-// =======================
-
-/// 發行交易（呼叫 /api/qrcode/(data|nodata) 會建立一筆）
-/// - 保存你送給沙盒的請求與回應（便於除錯/追溯）
-/// - **未設資料庫外鍵**：僅以 transactionId 串接應用層
-model VcTransaction {
-  id              Int           @id @default(autoincrement())
-  /// 交易序號（平台回給你的唯一識別）
-  transactionId   String        @unique @db.VarChar(64)
-  /// 模板識別（沙盒的 vcUid）
-  vcUid           String        @db.VarChar(128)
-  /// 發行模式：DATA/NODATA
-  mode            VcMode
-  /// 你送去沙盒的請求原文（含欄位值）
-  requestPayload  Json
-  /// 沙盒回的初始回應（含 qrcode / deeplink 等）
-  responsePayload Json?
-  /// 交易狀態（Created/Expired/Error）
-  status          VcTxStatus    @default(CREATED)
-  /// 建立時間
-  createdAt       DateTime      @default(now())
+/// 5. IssuanceLogs - 簽發日誌表
+model IssuanceLog {
+  id            BigInt            @id @default(autoincrement())
+  transactionId String            @unique @db.VarChar(255) // 簽發流程的暫時性 ID
+  status        IssuanceLogStatus // 使用 Enum (見下方定義)
+  expiresAt     DateTime?         // 流程超時時間
+  createdAt     DateTime          @default(now())
+  
+  // 關聯欄位
+  issuedVcId    BigInt
+  
+  // 關聯定義
+  issuedVC      IssuedVC          @relation(fields: [issuedVcId], references: [id])
 }
 
-/// VC 憑證本體（拿到 credential 後建立）
-/// - rawJwt 存原始 JWT/SD-JWT
-/// - **未設資料庫外鍵**：以 transactionId 對應發行交易（應用層手動關聯）
-model VcCredential {
-  id            Int          @id @default(autoincrement())
-  /// 憑證 CID（由 credential/jti 解析而來）
-  cid           String       @unique @db.VarChar(128)
-  /// 對應的發行交易 ID（邏輯上一對一，故設為 unique）
-  transactionId String       @unique @db.VarChar(64)
-  /// 原始憑證字串（JWT/SD-JWT），為除錯與溯源所需
-  rawJwt        String       @db.LongText
-  /// 憑證狀態（ISSUED/REVOKED）
-  status        VcCredStatus @default(ISSUED)
-  /// 發證時間
-  issuedAt      DateTime     @default(now())
-  /// 撤銷時間（如已撤銷）
-  revokedAt     DateTime?
+// [⭐️ 新增 ⭐️]
+/// 6. BatchVerificationSessions - 批次驗證工作階段表
+model BatchVerificationSession {
+  id                  BigInt            @id @default(autoincrement())
+  uuid                String            @unique @default(uuid()) @db.VarChar(255) // 供 QR Code 使用的 UUID
+  
+  // 驗證中繼資料 (由驗證方在建立工作階段時提供)
+  verifierInfo        String?           @db.VarChar(255) // (例如: 醫院)
+  verifierBranch      String?           @db.VarChar(255) // (例如: 林口長壽醫院)
+  verificationReason  String?           @db.VarChar(255)
+  notes               String?           @db.VarChar(500)
+  
+  status              BatchVerificationStatus // 使用 Enum (見下方定義)
+  
+  expiresAt           DateTime?         // 批次工作階段的超時時間
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  
+  // 關聯 (1-M)
+  verificationLogs    VerificationLog[]
 }
 
-/// 驗證請求（呼叫 /api/oidvp/qrcode 建立）
-/// - 保存 ref 與 tx，對應前端展示的 QR 與錢包互動
-/// - **未設資料庫外鍵**：以 transactionId 對應驗證結果（應用層手動關聯）
-model VpRequest {
-  id            Int         @id @default(autoincrement())
-  /// 驗證交易序號（你自產 UUID v4）
-  transactionId String      @unique @db.VarChar(64)
-  /// 驗證服務代碼（沙盒建立的 ref）
-  ref           String      @db.VarChar(128)
-  /// 狀態（建立中/已完成/逾時）
-  status        VpReqStatus @default(CREATED)
-  /// 建立時間
-  createdAt     DateTime    @default(now())
+/// 7. VerificationLogs - 驗證紀錄表 (原為 6)
+model VerificationLog {
+  id                  BigInt                @id @default(autoincrement())
+  transactionId       String                @unique @db.VarChar(255) // 驗證流程的暫時性 ID
+  verifyResult        Boolean?              // 驗證結果 (true/false)
+  resultDescription   String?               @db.VarChar(255)
+  returnedData        Json?                 // 驗證方收到的 claims 資料
+  
+  verifierInfo        String?               @db.VarChar(255) // (例如: 醫院)
+  
+  // 新增 verifierBranch (例如: 林口長庚醫院)
+  verifierBranch      String?               @db.VarChar(255)
+  
+  verificationReason  String?               @db.VarChar(255)
+  notes               String?               @db.VarChar(500)
+  status              VerificationStatus    // 使用 Enum (見下方定義)
+  expiresAt           DateTime?             // 流程超時時間
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  // 關聯欄位 (Nullable FK)，改為關聯至 Person
+  verifiedPersonId    BigInt?               
+  
+  // [⭐️ 新增 ⭐️] 關聯欄位 (Nullable FK)，用於批次驗證
+  batchVerificationSessionId BigInt?
+
+  // 關聯定義
+  verifiedPerson      Person?               @relation(fields: [verifiedPersonId], references: [id])
+  
+  // [⭐️ 新增 ⭐️] 關聯定義
+  batchVerificationSession BatchVerificationSession? @relation(fields: [batchVerificationSessionId], references: [id])
+
+  // [⭐️ 新增 ⭐️] 為 FK 建立索引
+  @@index([batchVerificationSessionId])
 }
 
-/// 驗證結果（呼叫 /api/oidvp/result 成功後落地）
-/// - 保存 verifyResult / claims 與原始回傳（溯源）
-/// - **未設資料庫外鍵**：以 transactionId 對應 VpRequest；可選以 vcCredentialCid 對應 VcCredential
-model VpResult {
-  id            Int       @id @default(autoincrement())
-  /// 對應的驗證交易序號（邏輯上一對一，因此 unique）
-  transactionId String    @unique @db.VarChar(64)
-  /// 驗證是否通過
-  verifyResult  Boolean
-  /// 選擇性揭露後的欄位（claims）
-  claims        Json
-  /// 上游原始回傳（保留以便日後比對）
-  raw           Json
-  /// 收到結果的時間
-  receivedAt    DateTime  @default(now())
 
-  /// （可選）對應的憑證 CID（如要記錄「這次驗證使用哪張 VC」）
-  vcCredentialCid String? @db.VarChar(128)
+// -------------------------------------------------
+// 列舉類型 (Enums) - 提升資料一致性
+// -------------------------------------------------
+
+/// IssuedVCs.status 的可能值
+enum IssuanceStatus {
+  issuing
+  issued
+  expired
+  revoked
+}
+
+/// IssuanceLogs.status 的可能值
+enum IssuanceLogStatus {
+  initiated
+  user_claimed
+  expired
+}
+
+/// VerificationLogs.status 的可能值
+enum VerificationStatus {
+  initiated
+  success
+  failed
+  expired
+  error_missing_uuid // (這個 Enum 值被重用於 "找不到 personalId" 或 "DB 中查無此人")
+}
+
+// [⭐️ 新增 ⭐️]
+/// BatchVerificationSessions.status 的可能值
+enum BatchVerificationStatus {
+  active   // 工作階段進行中
+  closed   // 已由驗證方手動關閉
+  expired  // 工作階段已自動過期
 }
