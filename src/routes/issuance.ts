@@ -456,15 +456,6 @@ function handleRequestCredentialError(err: unknown, res: Response) {
 
 router.post('/request-credential', async (req: Request, res: Response) => {
   try {
-    console.log('[request-credential] 請求開始。');
-    console.log(
-      '[request-credential] 收到的 headers.cookie:',
-      req.headers.cookie
-    );
-    console.log(
-      '[request-credential] 收到的 session 物件:',
-      JSON.stringify(req.session)
-    );
 
     const ids = extractIdsFromRequest(req);
     const env = getWalletEnv();
