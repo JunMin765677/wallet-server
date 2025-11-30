@@ -47,5 +47,16 @@ ENV NODE_ENV=production
 # 聲明容器會監聽 8001
 EXPOSE 8001
 
+
+# 建非 root 使用者
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+# COPY . /app
+# RUN chown -R appuser:appgroup /app
+
+# 之後都用這個 user 執行
+USER appuser
+
 # 容器啟動時的預設指令
 CMD ["npm", "run", "start"]

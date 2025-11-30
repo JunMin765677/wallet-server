@@ -46,17 +46,26 @@ app.use(cors({
 // 2. 解析 JSON Body
 app.use(express.json());
 
-// 3. 設定 Express Session
-app.use(session({
-  secret: 'your-very-secret-key-change-this', // 請替換成一個安全的密鑰
-  resave: false,
-  saveUninitialized: true, // 允許儲存新的 session
-  cookie: {
-    secure: process.env.NODE_ENV === 'production', // 生產環境中應為 true (https)
-    httpOnly: true,
-    maxAge: 1000 * 60 * 30 // Session 存活 30 分鐘
+const sessionSecret = process.env.SESSION_SECRET;
+if (!sessionSecret) {
+  // dev 環境可以給預設，但 production 建議直接 throw
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET is required in production');
   }
-}));
+}
+
+app.use(
+  session({
+    secret: sessionSecret || 'dev-only-secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+    },
+  }),
+);
 
 // --- 路由 (Routes) ---
 

@@ -3515,7 +3515,6 @@ async function main() {
 // 5. 執行並處理錯誤
 main()
   .catch((e) => {
-    console.error(e);
     process.exit(1);
   })
   .finally(async () => {

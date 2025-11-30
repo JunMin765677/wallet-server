@@ -3,7 +3,6 @@ import { Router } from 'express';
 import { prisma } from '../index';
 import { VerificationStatus, IssuanceStatus, BatchVerificationStatus } from '@prisma/client';
 import type { 
-  Prisma, 
   VerificationLog 
 } from '@prisma/client';
 import * as qrcode from 'qrcode';
@@ -115,104 +114,216 @@ async function getVerificationSuccessPayload(personId: bigint, rawSandboxData: a
  * 輪詢並更新 "單一" 批次 Log (不回傳任何值)
  * (此函式在 check-batch-status 中被呼叫)
  */
-async function pollAndUpdateBatchLog(log: VerificationLog) {
-  // 1. 檢查是否已過期 (Log 本身)
-  if (log.expiresAt && new Date() > log.expiresAt) {
-    await prisma.verificationLog.update({
-      where: { id: log.id },
-      data: { status: VerificationStatus.expired },
-    });
-    return; // 已處理
+// === Helper 區 ===
+
+async function markLogExpired(logId: bigint | number) {
+  await prisma.verificationLog.update({
+    where: { id: logId },
+    data: { status: VerificationStatus.expired },
+  });
+}
+
+function isLogExpired(log: VerificationLog): boolean {
+  return !!log.expiresAt && new Date() > log.expiresAt;
+}
+
+async function callVerifierResultApi(log: VerificationLog) {
+  const apiBase = process.env.VERIFIER_API_BASE;
+  const apiKey = process.env.VERIFIER_API_KEY;
+  // 這裡照你原本註解，不另外檢查 env
+
+  return axios.post(
+    `${apiBase}/api/oidvp/result`,
+    { transactionId: log.transactionId },
+    {
+      headers: {
+        'Access-Token': apiKey,
+        'Content-Type': 'application/json',
+        accept: '*/*',
+      },
+    }
+  );
+}
+
+async function updateLogAsVerifyFailed(
+  logId: bigint | number,
+  description: string,
+  returnedData?: unknown
+) {
+  await prisma.verificationLog.update({
+    where: { id: logId },
+    data: {
+      status: VerificationStatus.failed,
+      verifyResult: false,
+      resultDescription: description,
+      returnedData,
+    },
+  });
+}
+
+function extractPersonalIdFromResult(data: any): string | null {
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+  const first = data[0];
+  if (!first.claims || !Array.isArray(first.claims)) {
+    return null;
   }
 
-  // 2. 呼叫 Sandbox API
+  const claim = first.claims.find((c: any) => c.ename === 'personalId');
+  if (claim && claim.value) {
+    return String(claim.value);
+  }
+  return null;
+}
+
+async function handleVerificationSuccess(
+  log: VerificationLog,
+  vpResult: VpResultResponse,
+  returnedData: unknown
+) {
+  const personalId = extractPersonalIdFromResult(vpResult.data);
+
+  // 6. 找不到 personalId
+  if (!personalId) {
+    await prisma.verificationLog.update({
+      where: { id: log.id },
+      data: {
+        status: VerificationStatus.error_missing_uuid,
+        verifyResult: true,
+        resultDescription: '驗證成功，但資料缺少 personalId',
+        returnedData,
+      },
+    });
+    return;
+  }
+
+  // 7. 完美成功 (transaction 裡更新、關聯 person)
+  await prisma.$transaction(async (tx) => {
+    const person = await tx.person.findUnique({
+      where: { personalId },
+      select: { id: true },
+    });
+
+    if (!person) {
+      await tx.verificationLog.update({
+        where: { id: log.id },
+        data: {
+          status: VerificationStatus.error_missing_uuid,
+          verifyResult: true,
+          resultDescription:
+            '驗證成功，但無法在資料庫中關聯使用者',
+          returnedData,
+          verifiedPersonId: null,
+        },
+      });
+    } else {
+      await tx.verificationLog.update({
+        where: { id: log.id },
+        data: {
+          status: VerificationStatus.success,
+          verifyResult: true,
+          resultDescription: vpResult.resultDescription || '驗證成功',
+          returnedData,
+          verifiedPersonId: person.id,
+        },
+      });
+    }
+  });
+}
+
+function isPendingErrorFromAxios(err: any): boolean {
+  if (!err.response?.status || !err.response?.data?.params) {
+    return false;
+  }
+
+  if (err.response.status !== 400) return false;
+
   try {
-    const apiBase = process.env.VERIFIER_API_BASE;
-    const apiKey = process.env.VERIFIER_API_KEY;
-    // (不檢查 env，假設在主函式已檢查)
-    
-    const apiResponse = await axios.post(
-      `${apiBase}/api/oidvp/result`,
-      { transactionId: log.transactionId },
-      { headers: { 'Access-Token': apiKey, 'Content-Type': 'application/json', 'accept': '*/*' } }
-    );
+    const rawParams = err.response.data.params;
+    const parsed =
+      typeof rawParams === 'string'
+        ? JSON.parse(rawParams)
+        : rawParams;
+    return parsed?.code === 4002;
+  } catch {
+    return false;
+  }
+}
 
-    // 3. (Step 20) Sandbox 成功回傳
-    const { data, verifyResult, resultDescription } = apiResponse.data as VpResultResponse;
+async function handlePollAxiosError(
+  logId: bigint | number,
+  err: any
+): Promise<void> {
+  if (isPendingErrorFromAxios(err)) {
+    // 狀態為 initiated / pending，什麼都不做
+    return;
+  }
+
+  // 其他 Sandbox 錯誤 -> 標記為 failed
+  await prisma.verificationLog.update({
+    where: { id: logId },
+    data: {
+      status: VerificationStatus.failed,
+      resultDescription: 'Sandbox 輪詢錯誤',
+    },
+  });
+}
+
+async function handlePollUnknownError(logId: bigint | number) {
+  await prisma.verificationLog.update({
+    where: { id: logId },
+    data: {
+      status: VerificationStatus.failed,
+      resultDescription: '內部輪詢錯誤',
+    },
+  });
+}
+
+
+// === 重構後的主函式 ===
+
+async function pollAndUpdateBatchLog(log: VerificationLog) {
+  // 1. 檢查是否已過期 (Log 本身)
+  if (isLogExpired(log)) {
+    await markLogExpired(log.id);
+    return;
+  }
+
+  try {
+    // 2. 呼叫 Sandbox API
+    const apiResponse = await callVerifierResultApi(log);
+
+    // 3. Sandbox 成功回傳
+    const vpResult = apiResponse.data as VpResultResponse;
     const returnedData = apiResponse.data;
+    const { verifyResult, resultDescription } = vpResult;
 
-    // 4. (Step 21 - Case A) 驗證失敗
+    // 4. 驗證失敗
     if (verifyResult === false) {
       await prisma.verificationLog.update({
         where: { id: log.id },
-        data: { status: VerificationStatus.failed, verifyResult: false, resultDescription: resultDescription || '驗證失敗', returnedData: returnedData },
+        data: {
+          status: VerificationStatus.failed,
+          verifyResult: false,
+          resultDescription: resultDescription || '驗證失敗',
+          returnedData,
+        },
       });
       return;
     }
 
-    // 5. (Step 21 - Case B) 驗證成功，找出 personalId
-    let foundPersonalIdString: string | null = null;
-    if (data && Array.isArray(data) && data.length > 0 && data[0].claims && Array.isArray(data[0].claims)) {
-      const claim = data[0].claims.find(c => c.ename === 'personalId');
-      if (claim && claim.value) { foundPersonalIdString = claim.value; }
-    }
-
-    // 6. (Step 21 - Sub-Case B2) 找不到 personalId
-    if (!foundPersonalIdString) {
-      await prisma.verificationLog.update({
-        where: { id: log.id },
-        data: { status: VerificationStatus.error_missing_uuid, verifyResult: true, resultDescription: '驗證成功，但資料缺少 personalId', returnedData: returnedData },
-      });
-      return;
-    }
-
-    // 7. (Step 21 - Sub-Case B1) 完美成功
-    // (我們必須在 $transaction 中執行此操作，以防 Person 查找失敗)
-    await prisma.$transaction(async (tx) => {
-      const person = await tx.person.findUnique({
-        where: { personalId: foundPersonalIdString as string },
-        select: { id: true }
-      });
-
-      if (!person) {
-        await tx.verificationLog.update({
-          where: { id: log.id },
-          data: { status: VerificationStatus.error_missing_uuid, verifyResult: true, resultDescription: '驗證成功，但無法在資料庫中關聯使用者', returnedData: returnedData, verifiedPersonId: null },
-        });
-      } else {
-        await tx.verificationLog.update({
-          where: { id: log.id },
-          data: { status: VerificationStatus.success, verifyResult: true, resultDescription: resultDescription || '驗證成功', returnedData: returnedData, verifiedPersonId: person.id },
-        });
-      }
-    });
-
+    // 5–7. 驗證成功相關處理（含 personalId 判斷與 DB 更新）
+    await handleVerificationSuccess(log, vpResult, returnedData);
   } catch (err) {
-    // 8. 處理 Sandbox API 的 "pending"
     if (axios.isAxiosError(err)) {
-      if (err.response?.status === 400 && err.response?.data?.params) {
-        try {
-          const paramsData = JSON.parse(err.response.data.params);
-          if (paramsData.code === 4002) {
-            // 狀態為 'initiated'，是 "pending"，我們什麼都不做
-            return; 
-          }
-        } catch (parseError) { /* ... */ }
-      }
-      // 其他 Sandbox 錯誤 (例如 500) -> 我們將此 Log 標記為 failed
-      await prisma.verificationLog.update({
-        where: { id: log.id },
-        data: { status: VerificationStatus.failed, resultDescription: 'Sandbox 輪詢錯誤' },
-      });
+      await handlePollAxiosError(log.id, err);
     } else {
-      // 程式碼內部錯誤
-      await prisma.verificationLog.update({
-        where: { id: log.id },
-        data: { status: VerificationStatus.failed, resultDescription: '內部輪詢錯誤' },
-      });
+      await handlePollUnknownError(log.id);
     }
   }
 }
+
 // -------------------------------------------------
 
 
@@ -226,140 +337,219 @@ const router = Router();
  * 輸入 (Body): { verificationMode: string, role: string, verifier: string, reason: string, notes?: string }
  * 輸出 (Success): { ..., expiresAt: string }
  */
-router.post('/request-verification', async (req, res) => {
-  try {
-    // --- Step 5: 取得 Verifier FE 傳入的 metadata ---
-    const { verificationMode, role, verifier, reason, notes } = req.body as {
-      verificationMode: 'single' | 'batch';
-      role: string;
-      verifier: string;
-      reason: string;
-      notes?: string;
+/** ========= 型別 & 自訂錯誤 ========= */
+
+type VerificationMode = 'single' | 'batch';
+
+interface VerificationRequestBody {
+  verificationMode: VerificationMode;
+  role: string;
+  verifier: string;
+  reason: string;
+  notes?: string;
+}
+
+class RequestVerificationError extends Error {
+  constructor(
+    public code:
+      | 'MISSING_FIELDS'
+      | 'INVALID_MODE'
+      | 'ENV_VERIFIER_API'
+      | 'ENV_APP_BASE',
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+/** ========= 小工具函式 ========= */
+
+function parseVerificationRequestBody(body: any): VerificationRequestBody {
+  const {
+    verificationMode,
+    role,
+    verifier,
+    reason,
+    notes,
+  } = body as VerificationRequestBody;
+
+  if (!role || !verifier || !reason) {
+    throw new RequestVerificationError(
+      'MISSING_FIELDS',
+      'role (角色), verifier (單位), reason (目的) 均為必填'
+    );
+  }
+
+  if (!['single', 'batch'].includes(verificationMode)) {
+    throw new RequestVerificationError(
+      'INVALID_MODE',
+      '未提供有效的 verificationMode ("single" 或 "batch")'
+    );
+  }
+
+  return { verificationMode, role, verifier, reason, notes };
+}
+
+function getVerifierApiEnv() {
+  const apiBase = process.env.VERIFIER_API_BASE;
+  const apiKey = process.env.VERIFIER_API_KEY;
+
+  if (!apiBase || !apiKey) {
+    throw new RequestVerificationError(
+      'ENV_VERIFIER_API',
+      '伺服器設定錯誤 (VERIFIER_API)'
+    );
+  }
+
+  return { apiBase, apiKey };
+}
+
+function getAppBaseUrlEnv() {
+  const appBaseUrl = process.env.APP_BASE_URL;
+  if (!appBaseUrl) {
+    throw new RequestVerificationError(
+      'ENV_APP_BASE',
+      '伺服器設定錯誤 (APP_BASE_URL)'
+    );
+  }
+  return appBaseUrl;
+}
+
+/** ========= 單次驗證 flow ========= */
+
+async function startSingleVerification(
+  payload: VerificationRequestBody
+) {
+  const { role, verifier, reason, notes } = payload;
+  const { apiBase, apiKey } = getVerifierApiEnv();
+
+  const transactionId = uuidv4();
+  const fixedRef = '00000000_template001';
+
+  const apiResponse = await axios.get(
+    `${apiBase}/api/oidvp/qrcode`,
+    {
+      params: { ref: fixedRef, transactionId },
+      headers: {
+        'Access-Token': apiKey,
+        accept: '*/*',
+      },
+    }
+  );
+
+  const { qrcodeImage, authUri } = apiResponse.data;
+  if (!qrcodeImage || !authUri) {
+    throw new Error('Sandbox API 回傳資料不完整');
+  }
+
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // +5 分鐘
+
+  await prisma.verificationLog.create({
+    data: {
+      transactionId,
+      verifierInfo: role,
+      verifierBranch: verifier,
+      verificationReason: reason,
+      notes: notes ?? null,
+      status: VerificationStatus.initiated,
+      expiresAt,
+      batchVerificationSessionId: null,
+    },
+  });
+
+  return {
+    type: 'single' as const,
+    transactionId,
+    qrCode: qrcodeImage,
+    deepLink: authUri,
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+/** ========= 批次驗證 flow ========= */
+
+async function startBatchVerification(
+  payload: VerificationRequestBody
+) {
+  const { role, verifier, reason, notes } = payload;
+  const appBaseUrl = getAppBaseUrlEnv();
+
+  const expiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000); // +3 小時
+
+  const newSession = await prisma.batchVerificationSession.create({
+    data: {
+      verifierInfo: role,
+      verifierBranch: verifier,
+      verificationReason: reason,
+      notes: notes ?? null,
+      status: BatchVerificationStatus.active,
+      expiresAt,
+    },
+  });
+
+  const batchUrl = `${appBaseUrl}/api/verification/batch/${newSession.uuid}`;
+  const qrCodeImage = await qrcode.toDataURL(batchUrl);
+
+  return {
+    type: 'batch' as const,
+    batchSessionUuid: newSession.uuid,
+    qrCode: qrCodeImage,
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+/** ========= 錯誤處理集中 ========= */
+
+function handleRequestVerificationError(
+  err: unknown,
+  res: Response
+) {
+
+  if (err instanceof RequestVerificationError) {
+    const statusMap: Record<RequestVerificationError['code'], number> = {
+      MISSING_FIELDS: 400,
+      INVALID_MODE: 400,
+      ENV_VERIFIER_API: 500,
+      ENV_APP_BASE: 500,
     };
+    return res
+      .status(statusMap[err.code])
+      .json({ message: err.message });
+  }
 
-    // --- 驗證輸入 ---
-    if (!role || !verifier || !reason) {
-      return res.status(400).json({ message: 'role (角色), verifier (單位), reason (目的) 均為必填' });
-    }
-    if (!['single', 'batch'].includes(verificationMode)) {
-      return res.status(400).json({ message: '未提供有效的 verificationMode ("single" 或 "batch")' });
-    }
-
-    // --- Step 6: 流程分岔 ---
-    
-    // ===========================================
-    // Case A: 單次驗證 (verificationMode: "single")
-    // ===========================================
-    if (verificationMode === 'single') {
-      
-      // --- (Step 14a) 準備呼叫 Sandbox API ---
-      const apiBase = process.env.VERIFIER_API_BASE;
-      const apiKey = process.env.VERIFIER_API_KEY;
-      if (!apiBase || !apiKey) {
-        console.error('VERIFIER_API 環境變數未設定');
-        return res.status(500).json({ message: '伺服器設定錯誤 (VERIFIER_API)' });
-      }
-
-      const transactionId = uuidv4();
-      const fixedRef = '00000000_template001';
-
-      const apiResponse = await axios.get(
-        `${apiBase}/api/oidvp/qrcode`,
-        {
-          params: { ref: fixedRef, transactionId: transactionId },
-          headers: { 'Access-Token': apiKey, 'accept': '*/*' },
-        }
-      );
-
-      // --- (Step 15a) 取得 Sandbox 回傳資料 ---
-      const { qrcodeImage, authUri } = apiResponse.data;
-      if (!qrcodeImage || !authUri) {
-        throw new Error('Sandbox API 回傳資料不完整');
-      }
-
-      // --- (Step 16a) 預先寫入 VerificationLogs ---
-      const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // +5 分鐘
-
-      await prisma.verificationLog.create({
-        data: {
-          transactionId: transactionId,
-          verifierInfo: role,
-          verifierBranch: verifier,
-          verificationReason: reason,
-          notes: notes ?? null,
-          status: VerificationStatus.initiated,
-          expiresAt: expiresAt, // 存入 DB
-          batchVerificationSessionId: null,
-        },
-      });
-
-      // --- (Step 17a) 回傳給 Verifier FE ---
-      return res.status(200).json({
-        type: 'single',
-        transactionId: transactionId,
-        qrCode: qrcodeImage,
-        deepLink: authUri,
-        expiresAt: expiresAt.toISOString(), // [⭐️ 新增 ⭐️] 回傳 ISO 格式時間戳
-      });
-    }
-    
-    // ===========================================
-    // Case B: 批次驗證 (verificationMode: "batch")
-    // ===========================================
-    else { // (verificationMode === 'batch')
-      
-      // --- (Step 14b) 建立批次工作階段 ---
-      const appBaseUrl = process.env.APP_BASE_URL;
-      if (!appBaseUrl) {
-        console.error('環境變數 APP_BASE_URL 未設定');
-        return res.status(500).json({ message: '伺服器設定錯誤 (APP_BASE_URL)' });
-      }
-
-      const expiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000); // +3 小時
-
-      const newSession = await prisma.batchVerificationSession.create({
-        data: {
-          verifierInfo: role,
-          verifierBranch: verifier,
-          verificationReason: reason,
-          notes: notes ?? null,
-          status: BatchVerificationStatus.active,
-          expiresAt: expiresAt, // 存入 DB
-        },
-      });
-
-      // --- (Step 17b) 產生我們自己的 QR code ---
-      // (假設 BE-2 路由為 /api/verification/batch/:uuid)
-      const batchUrl = `${appBaseUrl}/api/verification/batch/${newSession.uuid}`;
-      
-      // 將 URL 轉換為 Base64 圖片
-      const qrCodeImage = await qrcode.toDataURL(batchUrl);
-
-      // --- (Step 17b) 回傳給 Verifier FE ---
-      return res.status(200).json({
-        type: 'batch',
-        batchSessionUuid: newSession.uuid,
-        qrCode: qrCodeImage,
-        expiresAt: expiresAt.toISOString(), // [⭐️ 新增 ⭐️] 回傳 ISO 格式時間戳
-      });
-    }
-
-  } catch (err) {
-    console.error('[Verifier BE] /request-verification error:', err);
-    if (axios.isAxiosError(err)) {
-      console.error('Sandbox Verifier API Error:', err.response?.data || err.message);
-      return res.status(502).json({
-        message: '呼叫 Sandbox 驗證 API 失敗', 
-        error: err.response?.data 
-      });
-    }
-    // 處理 qrcode 產生錯誤或其他錯誤
-    return res.status(500).json({ 
-      message: '伺服器內部錯誤',
-      error: err instanceof Error ? err.message : String(err)
+  if (axios.isAxiosError(err)) {
+    return res.status(502).json({
+      message: '呼叫 Sandbox 驗證 API 失敗',
+      error: err.response?.data,
     });
   }
-});
+
+  return res.status(500).json({
+    message: '伺服器內部錯誤',
+    error: err instanceof Error ? err.message : String(err),
+  });
+}
+
+/** ========= Route 本體（瘦版） ========= */
+
+router.post(
+  '/request-verification',
+  async (req: Request, res: Response) => {
+    try {
+      const payload = parseVerificationRequestBody(req.body);
+
+      if (payload.verificationMode === 'single') {
+        const result = await startSingleVerification(payload);
+        return res.status(200).json(result);
+      }
+
+      const result = await startBatchVerification(payload);
+      return res.status(200).json(result);
+    } catch (err) {
+      return handleRequestVerificationError(err, res);
+    }
+  }
+);
 
 /**
  * [GET] /api/verification/batch/:uuid
@@ -407,7 +597,6 @@ router.get('/batch/:uuid', async (req, res) => {
     const apiBase = process.env.VERIFIER_API_BASE;
     const apiKey = process.env.VERIFIER_API_KEY;
     if (!apiBase || !apiKey) {
-      console.error('VERIFIER_API 環境變數未設定 (in /batch/:uuid)');
       return res.status(500).json({ message: '伺服器設定錯誤 (VERIFIER_API)' });
     }
 
@@ -454,9 +643,7 @@ router.get('/batch/:uuid', async (req, res) => {
     return res.redirect(302, authUri);
 
   } catch (err) {
-    console.error(`[Verifier BE] /batch/${req.params.uuid} error:`, err);
     if (axios.isAxiosError(err)) {
-      console.error('Sandbox Verifier API Error (in /batch):', err.response?.data || err.message);
       return res.status(502).json({
         message: '呼叫 Sandbox 驗證 API 失敗', 
         error: err.response?.data 
@@ -478,104 +665,142 @@ router.get('/batch/:uuid', async (req, res) => {
  *
  * @param {string} transactionId - (來自 URL) 
  */
-router.get('/check-status/:transactionId', async (req, res) => {
+class CheckStatusError extends Error {
+  constructor(
+    public httpStatus: number,
+    public body: any
+  ) {
+    super(body?.message || '');
+  }
+}
+
+/** ========= 小工具函式 ========= */
+
+function parseTransactionId(req: Request): string {
   const { transactionId } = req.params;
   if (!transactionId) {
-    return res.status(400).json({ message: '未提供 transactionId' });
+    throw new CheckStatusError(400, { message: '未提供 transactionId' });
+  }
+  return transactionId;
+}
+
+async function findVerificationLogOrThrow(transactionId: string) {
+  const log = await prisma.verificationLog.findUnique({
+    where: { transactionId },
+  });
+
+  if (!log) {
+    throw new CheckStatusError(404, { message: '找不到此驗證流程' });
   }
 
-  try {
-    // 1. 檢查我方資料庫的紀錄
-    const log = await prisma.verificationLog.findUnique({
-      where: { transactionId: transactionId },
-    });
+  return log;
+}
 
-    if (!log) {
-      return res.status(404).json({ message: '找不到此驗證流程' });
-    }
+function isLogExpired(log: any): boolean {
+  return !!log.expiresAt && new Date() > log.expiresAt;
+}
 
-    // 2. 如果狀態不是 'initiated' (已完成)
-    if (log.status !== VerificationStatus.initiated) {
-      
-      // (此區塊處理 "已完成" 的 Log)
-      if (log.status === VerificationStatus.success && log.verifiedPersonId) {
-        // [⭐️ 關鍵 ⭐️] 呼叫輔助函式抓取完整資料
-        const verificationData = await getVerificationSuccessPayload(log.verifiedPersonId, log.returnedData);
-        
-        if (!verificationData) {
-          return res.status(404).json({ status: log.status, message: "驗證成功，但關聯的使用者資料已不存在" });
-        }
+async function markLogExpiredAndBuildResponse(log: any) {
+  const updatedLog = await prisma.verificationLog.update({
+    where: { id: log.id },
+    data: { status: VerificationStatus.expired },
+  });
 
-        return res.status(200).json({
-          status: log.status,
-          message: log.resultDescription,
-          verificationData: verificationData, // (回傳完整資料)
-        });
-      }
-      
-      // (failed, expired, error_missing_uuid...)
-      return res.status(200).json({
-        status: log.status,
-        message: log.resultDescription || '驗證流程已結束',
-        data: log.returnedData, // (失敗時回傳原始 data)
-      });
-    }
+  return {
+    httpStatus: 200,
+    body: {
+      status: updatedLog.status,
+      message: '驗證流程已過期',
+    },
+  };
+}
 
-    // 3. (Step 22) 檢查是否已過期
-    if (log.expiresAt && new Date() > log.expiresAt) {
-      const updatedLog = await prisma.verificationLog.update({
-        where: { id: log.id }, data: { status: VerificationStatus.expired },
-      });
-      return res.status(200).json({ status: updatedLog.status, message: '驗證流程已過期' });
-    }
-
-    // 4. (Step 19) 呼叫 Sandbox API 輪詢
-    const apiBase = process.env.VERIFIER_API_BASE;
-    const apiKey = process.env.VERIFIER_API_KEY;
-    if (!apiBase || !apiKey) { return res.status(500).json({ message: '伺服器設定錯誤 (VERIFIER_API)' }); }
-
-    const apiResponse = await axios.post(
-      `${apiBase}/api/oidvp/result`,
-      { transactionId: transactionId }, 
-      { headers: { 'Access-Token': apiKey, 'Content-Type': 'application/json', 'accept': '*/*' } }
+async function buildCompletedLogResponse(log: any) {
+  // 已完成的 Log（非 initiated）
+  if (log.status === VerificationStatus.success && log.verifiedPersonId) {
+    const verificationData = await getVerificationSuccessPayload(
+      log.verifiedPersonId,
+      log.returnedData
     );
 
-    // 5. (Step 20) Sandbox API 成功回傳
-    const { data, verifyResult, resultDescription } = apiResponse.data as VpResultResponse;
-    const returnedData = apiResponse.data; 
-
-    // 6. (Step 21 - Case A) 驗證失敗
-    if (verifyResult === false) {
-      const updatedLog = await prisma.verificationLog.update({
-        where: { id: log.id },
-        data: { status: VerificationStatus.failed, verifyResult: false, resultDescription: resultDescription || '驗證失敗', returnedData: returnedData },
-      });
-      return res.status(200).json({ status: updatedLog.status, message: updatedLog.resultDescription });
+    if (!verificationData) {
+      return {
+        httpStatus: 404,
+        body: {
+          status: log.status,
+          message: '驗證成功，但關聯的使用者資料已不存在',
+        },
+      };
     }
 
-    // 7. (Step 21 - Case B) 驗證成功，找出 personalId
-    let foundPersonalIdString: string | null = null; 
-    if (data && Array.isArray(data) && data.length > 0) {
-      if (data[0].claims && Array.isArray(data[0].claims)) {
-        const claim = data[0].claims.find(c => c.ename === 'personalId');
-        if (claim && claim.value) { foundPersonalIdString = claim.value; }
-      }
-    }
+    return {
+      httpStatus: 200,
+      body: {
+        status: log.status,
+        message: log.resultDescription,
+        verificationData,
+      },
+    };
+  }
 
-    // 8. (Step 21 - Sub-Case B2) 成功，但找不到 personalId (異常)
-    if (!foundPersonalIdString) {
-      const updatedLog = await prisma.verificationLog.update({
-        where: { id: log.id },
-        data: { status: VerificationStatus.error_missing_uuid, verifyResult: true, resultDescription: '驗證成功，但資料缺少 personalId', returnedData: returnedData },
-      });
-      return res.status(200).json({ status: updatedLog.status, message: updatedLog.resultDescription, data: returnedData });
-    }
+  // failed, expired, error_missing_uuid...
+  return {
+    httpStatus: 200,
+    body: {
+      status: log.status,
+      message: log.resultDescription || '驗證流程已結束',
+      data: log.returnedData,
+    },
+  };
+}
 
-    // 9. (Step 21) 完美成功，找到 personalId，存入 DB
-    const { updatedLog, personId } = await prisma.$transaction(async (tx) => {
+function getVerifierApiEnvForCheck() {
+  const apiBase = process.env.VERIFIER_API_BASE;
+  const apiKey = process.env.VERIFIER_API_KEY;
+  if (!apiBase || !apiKey) {
+    throw new CheckStatusError(500, {
+      message: '伺服器設定錯誤 (VERIFIER_API)',
+    });
+  }
+  return { apiBase, apiKey };
+}
+
+
+async function updateLogOnVerifyFailed(
+  log: any,
+  resultDescription: string | undefined,
+  returnedData: unknown
+) {
+  const updatedLog = await prisma.verificationLog.update({
+    where: { id: log.id },
+    data: {
+      status: VerificationStatus.failed,
+      verifyResult: false,
+      resultDescription: resultDescription || '驗證失敗',
+      returnedData,
+    },
+  });
+
+  return {
+    httpStatus: 200,
+    body: {
+      status: updatedLog.status,
+      message: updatedLog.resultDescription,
+    },
+  };
+}
+
+async function runVerificationSuccessTransaction(
+  log: any,
+  foundPersonalIdString: string,
+  resultDescription: string | undefined,
+  returnedData: unknown
+) {
+  const { updatedLog, personId } = await prisma.$transaction(
+    async (tx) => {
       const person = await tx.person.findUnique({
-        where: { personalId: foundPersonalIdString as string },
-        select: { id: true }
+        where: { personalId: foundPersonalIdString },
+        select: { id: true },
       });
 
       let personId: bigint | null = null;
@@ -595,54 +820,182 @@ router.get('/check-status/:transactionId', async (req, res) => {
           status: finalStatus,
           verifyResult: true,
           resultDescription: finalDescription,
-          returnedData: returnedData,
+          returnedData,
           verifiedPersonId: personId,
         },
       });
-      return { updatedLog, personId }; // 回傳 personId
+
+      return { updatedLog, personId };
+    }
+  );
+
+  // 組合最終回應
+  if (updatedLog.status !== VerificationStatus.success || !personId) {
+    return {
+      httpStatus: 200,
+      body: {
+        status: updatedLog.status,
+        message: updatedLog.resultDescription,
+        data: returnedData,
+      },
+    };
+  }
+
+  const verificationData = await getVerificationSuccessPayload(
+    personId,
+    returnedData
+  );
+
+  return {
+    httpStatus: 200,
+    body: {
+      status: updatedLog.status,
+      message: updatedLog.resultDescription,
+      verificationData,
+    },
+  };
+}
+
+function isPendingErrorFromAxiosForCheck(err: any): boolean {
+  if (err.response?.status !== 400 || !err.response?.data?.params) {
+    return false;
+  }
+
+  try {
+    const rawParams = err.response.data.params;
+    const parsed =
+      typeof rawParams === 'string'
+        ? JSON.parse(rawParams)
+        : rawParams;
+    return parsed?.code === 4002;
+  } catch {
+    return false;
+  }
+}
+
+function handleAxiosErrorForCheckStatus(err: any, transactionId: string) {
+  if (isPendingErrorFromAxiosForCheck(err)) {
+    return {
+      httpStatus: 200,
+      body: {
+        status: VerificationStatus.initiated,
+        message: '使用者尚未出示憑證',
+      },
+    };
+  }
+
+  return {
+    httpStatus: 502,
+    body: {
+      message: 'Sandbox API 查詢失敗',
+      error: err.response?.data,
+    },
+  };
+}
+
+async function buildCheckStatusResponse(
+  log: any,
+  transactionId: string
+): Promise<{ httpStatus: number; body: any }> {
+  // 2. 若不是 initiated，表示已完成
+  if (log.status !== VerificationStatus.initiated) {
+    return buildCompletedLogResponse(log);
+  }
+
+  // 3. 檢查是否已過期
+  if (isLogExpired(log)) {
+    return markLogExpiredAndBuildResponse(log);
+  }
+
+  // 4. 呼叫 Sandbox API 輪詢
+  const { apiBase, apiKey } = getVerifierApiEnvForCheck();
+
+  const apiResponse = await axios.post(
+    `${apiBase}/api/oidvp/result`,
+    { transactionId },
+    {
+      headers: {
+        'Access-Token': apiKey,
+        'Content-Type': 'application/json',
+        accept: '*/*',
+      },
+    }
+  );
+
+  // 5. Sandbox API 成功回傳
+  const vpResult = apiResponse.data as VpResultResponse;
+  const returnedData = apiResponse.data;
+  const { data, verifyResult, resultDescription } = vpResult;
+
+  // 6. 驗證失敗
+  if (verifyResult === false) {
+    return updateLogOnVerifyFailed(log, resultDescription, returnedData);
+  }
+
+  // 7–9. 驗證成功 → 取 personalId → transaction 更新 & 組合回應
+  const foundPersonalIdString = extractPersonalIdFromResult(data);
+
+  if (!foundPersonalIdString) {
+    const updatedLog = await prisma.verificationLog.update({
+      where: { id: log.id },
+      data: {
+        status: VerificationStatus.error_missing_uuid,
+        verifyResult: true,
+        resultDescription: '驗證成功，但資料缺少 personalId',
+        returnedData,
+      },
     });
 
-    
-    // 10. (Step 25) 組合並回傳最終成功結果
-    
-    // (處理 "DB 找不到此人" 或 "找不到 personalId" 的情況)
-    if (updatedLog.status !== VerificationStatus.success || !personId) {
-      return res.status(200).json({
-          status: updatedLog.status, // error_missing_uuid
-          message: updatedLog.resultDescription,
-          data: returnedData,
+    return {
+      httpStatus: 200,
+      body: {
+        status: updatedLog.status,
+        message: updatedLog.resultDescription,
+        data: returnedData,
+      },
+    };
+  }
+
+  return runVerificationSuccessTransaction(
+    log,
+    foundPersonalIdString,
+    resultDescription,
+    returnedData
+  );
+}
+
+/** ========= Route 本體（瘦版） ========= */
+
+router.get(
+  '/check-status/:transactionId',
+  async (req: Request, res: Response) => {
+    let transactionId = '';
+    try {
+      transactionId = parseTransactionId(req);
+      const log = await findVerificationLogOrThrow(transactionId);
+
+      const result = await buildCheckStatusResponse(log, transactionId);
+      return res.status(result.httpStatus).json(result.body);
+    } catch (err) {
+      if (err instanceof CheckStatusError) {
+        return res.status(err.httpStatus).json(err.body);
+      }
+
+      if (axios.isAxiosError(err)) {
+        const result = handleAxiosErrorForCheckStatus(
+          err,
+          transactionId
+        );
+        return res.status(result.httpStatus).json(result.body);
+      }
+
+      return res.status(500).json({
+        message: '伺服器內部錯誤',
+        error: err instanceof Error ? err.message : String(err),
       });
     }
-
-    // [⭐️ 關鍵 ⭐️] 呼叫輔助函式抓取完整資料
-    const verificationData = await getVerificationSuccessPayload(personId, returnedData);
-
-    return res.status(200).json({
-      status: updatedLog.status, // success
-      message: updatedLog.resultDescription,
-      verificationData: verificationData, // (回傳完整資料)
-    });
-
-  } catch (err) {
-    // 11. (Step 19 - 進行中) 處理 Sandbox API 的 "pending" (HTTP 400 / code 4002)
-    // ... (此 catch 區塊邏輯不變) ...
-    if (axios.isAxiosError(err)) {
-      if (err.response?.status === 400 && err.response?.data?.params) {
-        try {
-          const paramsData = JSON.parse(err.response.data.params);
-          if (paramsData.code === 4002) {
-            return res.status(200).json({ status: VerificationStatus.initiated, message: '使用者尚未出示憑證' });
-          }
-        } catch (parseError) { /* ... */ }
-      }
-      console.error('Sandbox Verifier API Error:', err.response?.data || err.message);
-      return res.status(502).json({ message: 'Sandbox API 查詢失敗', error: err.response?.data });
-    }
-    // 12. 其他所有內部錯誤
-    console.error(`[Verifier BE] /check-status/${transactionId} error:`, err);
-    return res.status(500).json({ message: '伺服器內部錯誤', error: err instanceof Error ? err.message : String(err) });
   }
-});
+);
 
 /**
  * [GET] /api/verification/check-batch-status/:uuid
@@ -746,7 +1099,6 @@ router.get('/check-batch-status/:uuid', async (req, res) => {
     return res.status(200).json(responsePayload);
 
   } catch (err) {
-    console.error(`[Verifier BE] /check-batch-status/${uuid} error:`, err);
     return res.status(500).json({ 
       message: '伺服器內部錯誤',
       error: err instanceof Error ? err.message : String(err) 

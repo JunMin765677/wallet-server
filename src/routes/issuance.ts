@@ -92,7 +92,6 @@ router.post('/start-simulation', async (req, res) => {
     await new Promise<void>((resolve, reject) => {
       req.session.save((err) => {
         if (err) {
-          console.error('[start-simulation] ！！ Session 儲存失敗 ！！', err);
           reject(new Error('Session save error'));
         } else {
           console.log('[start-simulation] Session 已成功儲存 (saved)。');
@@ -150,7 +149,6 @@ router.post('/start-simulation', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[Issuer BE] /api/issuance/start-simulation 發生嚴重錯誤:', err);
     // ⭐️ Log 5: 檢查 try-catch 錯誤
     if (err instanceof Error && err.message === 'Session save error') {
       return res.status(500).json({ message: 'Session 儲存時發生錯誤' });
@@ -168,44 +166,179 @@ router.post('/start-simulation', async (req, res) => {
  * @desc    (Step 9-13) 使用者選擇模板後，請求 VC 簽發 (更新版)
  * @body    { templateId: number }
  */
-router.post('/request-credential', async (req, res) => {
-  try {
+type WalletEnv = {
+  apiBase: string;
+  apiKey: string;
+};
 
-    console.log('[request-credential] 請求開始。');
-    console.log('[request-credential] 收到的 headers.cookie:', req.headers.cookie);
-    console.log('[request-credential] 收到的 session 物件:', JSON.stringify(req.session));
-    
-    // --- Step 9: 取得 Session 和 Request Body ---
-    const { templateId } = req.body;
-    const personIdStr = req.session.personId;
+type IssuanceTransactionResult = {
+  qrCode: string;
+  deepLink: string;
+  transactionId: string;
+};
 
-    if (!personIdStr) {
-      return res.status(401).json({ message: '您尚未開始模擬身份驗證，請重新操作' });
+class IssuanceError extends Error {
+  constructor(
+    public code:
+      | 'UNAUTHORIZED'
+      | 'INVALID_TEMPLATE_ID'
+      | 'ENV_MISSING'
+      | 'PERSON_NOT_FOUND'
+      | 'TEMPLATE_NOT_FOUND'
+      | 'VCUID_MISSING'
+      | 'SANDBOX_INCOMPLETE',
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+/** ==== 小工具 function 區 ==== */
+
+function extractIdsFromRequest(req: Request): {
+  personId: bigint;
+  templateId: number;
+  systemUuid: string;
+} {
+  const personIdStr = req.session.personId;
+  const { templateId } = req.body as { templateId?: unknown };
+
+  if (!personIdStr) {
+    throw new IssuanceError(
+      'UNAUTHORIZED',
+      '您尚未開始模擬身份驗證，請重新操作'
+    );
+  }
+
+  if (typeof templateId !== 'number') {
+    throw new IssuanceError(
+      'INVALID_TEMPLATE_ID',
+      '未提供有效的 templateId (必須是數字)'
+    );
+  }
+
+  const personId = BigInt(personIdStr);
+  const systemUuid = uuidv4().replace(/-/g, '_');
+
+  return { personId, templateId, systemUuid };
+}
+
+function getWalletEnv(): WalletEnv {
+  const apiBase = process.env.WALLET_API_BASE;
+  const apiKey = process.env.WALLET_API_KEY;
+
+  if (!apiBase || !apiKey) {
+    throw new IssuanceError(
+      'ENV_MISSING',
+      '伺服器設定錯誤，無法呼叫簽發 API'
+    );
+  }
+
+  return { apiBase, apiKey };
+}
+
+function buildIssuedData(
+  templateId: number,
+  systemUuid: string,
+  person: {
+    name: string | null;
+    personalId: string | null;
+    emergencyContactName: string | null;
+    emergencyContactRelationship: string | null;
+    emergencyContactPhone: string | null;
+    reviewingAuthority: string | null;
+    reviewerName: string | null;
+    reviewerPhone: string | null;
+  }
+) {
+  const benefitLevel = generateBenefitLevel(templateId);
+
+  return {
+    benefitLevel,
+    issuedData: {
+      name: person.name,
+      personalId: person.personalId,
+      system_uuid: systemUuid,
+      benefitLevel,
+      emergencyContactName: person.emergencyContactName ?? '',
+      emergencyContactRelationship: person.emergencyContactRelationship ?? '',
+      emergencyContactPhone: person.emergencyContactPhone ?? '',
+      reviewingAuthority: person.reviewingAuthority ?? '',
+      reviewerName: person.reviewerName ?? '',
+      reviewerPhone: (person.reviewerPhone ?? '').replace(/-/g, ''),
+    },
+  };
+}
+
+function buildIssuancePayload(
+  vcUid: string,
+  issuedData: Record<string, unknown>
+) {
+  const today = new Date();
+  const issuanceDate = [
+    today.getFullYear(),
+    String(today.getMonth() + 1).padStart(2, '0'),
+    String(today.getDate()).padStart(2, '0'),
+  ].join('');
+
+  const fields = Object.entries(issuedData).map(([key, value]) => ({
+    ename: key,
+    content: String(value ?? ''),
+  }));
+
+  return {
+    vcUid,
+    issuanceDate,
+    expiredDate: '20251231',
+    fields,
+  };
+}
+
+async function callSandboxIssue(
+  apiBase: string,
+  apiKey: string,
+  payload: unknown
+): Promise<IssuanceTransactionResult> {
+  const apiResponse = await axios.post(
+    `${apiBase}/api/qrcode/data`,
+    payload,
+    {
+      headers: {
+        'Access-Token': apiKey,
+        'Content-Type': 'application/json',
+        accept: 'application/json',
+      },
     }
-    if (!templateId || typeof templateId !== 'number') {
-      return res.status(400).json({ message: '未提供有效的 templateId (必須是數字)' });
-    }
+  );
 
-    const personId = BigInt(personIdStr);
-    const systemUuid = uuidv4().replace(/-/g, '_');
+  const { transactionId, qrCode, deepLink } = apiResponse.data ?? {};
 
-    // --- 準備 API 呼叫的環境變數 ---
-    const apiBase = process.env.WALLET_API_BASE;
-    const apiKey = process.env.WALLET_API_KEY;
+  if (!transactionId || !qrCode || !deepLink) {
+    throw new IssuanceError(
+      'SANDBOX_INCOMPLETE',
+      'Sandbox API 回傳資料不完整'
+    );
+  }
 
-    if (!apiBase || !apiKey) {
-      console.error('環境變數 WALLET_API_BASE 或 WALLET_API_KEY 未設定');
-      return res.status(500).json({ message: '伺服器設定錯誤，無法呼叫簽發 API' });
-    }
+  return { transactionId, qrCode, deepLink };
+}
 
-    // --- Step 10, 11, 12: 執行資料庫交易與 API 呼叫 ---
-    const transactionResult = await prisma.$transaction(async (tx) => {
-      
-      // --- 10a: 取得 Person 和 Template 資料 ---
-      const person = await tx.person.findUnique({
+async function runIssuanceTransaction(params: {
+  personId: bigint;
+  templateId: number;
+  systemUuid: string;
+  apiBase: string;
+  apiKey: string;
+}): Promise<IssuanceTransactionResult> {
+  const { personId, templateId, systemUuid, apiBase, apiKey } = params;
+
+  return prisma.$transaction(async (tx) => {
+    // 1. 撈 person / template
+    const [person, template] = await Promise.all([
+      tx.person.findUnique({
         where: { id: personId },
-        select: { 
-          name: true, 
+        select: {
+          name: true,
           personalId: true,
           emergencyContactName: true,
           emergencyContactRelationship: true,
@@ -214,262 +347,382 @@ router.post('/request-credential', async (req, res) => {
           reviewerName: true,
           reviewerPhone: true,
         },
-      });
-      const template = await tx.vCTemplate.findUnique({
+      }),
+      tx.vCTemplate.findUnique({
         where: { id: templateId },
         select: { vcUid: true },
-      });
+      }),
+    ]);
 
-      if (!person) throw new Error('Person not found');
-      if (!template) throw new Error('Template not found');
-      if (!template.vcUid) throw new Error('Template vcUid is missing');
+    if (!person) {
+      throw new IssuanceError('PERSON_NOT_FOUND', 'Person not found');
+    }
+    if (!template) {
+      throw new IssuanceError('TEMPLATE_NOT_FOUND', 'Template not found');
+    }
+    if (!template.vcUid) {
+      throw new IssuanceError('VCUID_MISSING', 'Template vcUid is missing');
+    }
 
-      // --- 10b: 產生 Benefit Level 並準備 issued_data ---
-      // (將調用更新後的 generateBenefitLevel 函式)
-      const benefitLevel = generateBenefitLevel(templateId);
+    // 2. 組 issuedData / benefitLevel
+    const { issuedData, benefitLevel } = buildIssuedData(
+      templateId,
+      systemUuid,
+      person
+    );
 
-      const issued_data = {
-        name: person.name,
-        personalId: person.personalId,
-        system_uuid: systemUuid,
-        benefitLevel: benefitLevel,
-        emergencyContactName: person.emergencyContactName ?? '',
-        emergencyContactRelationship: person.emergencyContactRelationship ?? '',
-        emergencyContactPhone: person.emergencyContactPhone ?? '',
-        reviewingAuthority: person.reviewingAuthority ?? '',
-        reviewerName: person.reviewerName ?? '',
-        // (主動過濾 reviewerPhone 中的 '-' 字元)
-        reviewerPhone: (person.reviewerPhone ?? '').replace(/-/g, ''),
-      };
-
-      // --- 10c: 建立 IssuedVCs 紀錄 ---
-      const newIssuedVC = await tx.issuedVC.create({
-        data: {
-          systemUuid: systemUuid,
-          personId: personId,
-          templateId: templateId,
-          status: IssuanceStatus.issuing,
-          issuedData: issued_data, 
-          benefitLevel: benefitLevel, 
-        },
-      });
-
-      // --- 11: 呼叫 Sandbox API ---
-      const today = new Date();
-      const issuanceDate = [
-        today.getFullYear(),
-        String(today.getMonth() + 1).padStart(2, '0'),
-        String(today.getDate()).padStart(2, '0'),
-      ].join('');
-      
-      const apiFields = Object.entries(issued_data).map(([key, value]) => ({
-        ename: key,
-        content: String(value ?? ''),
-      }));
-
-      const apiPayload = {
-        vcUid: template.vcUid,
-        issuanceDate: issuanceDate,
-        expiredDate: "20251231",
-        fields: apiFields,
-      };
-
-      const apiResponse = await axios.post(
-        `${apiBase}/api/qrcode/data`,
-        apiPayload,
-        {
-          headers: {
-            'Access-Token': apiKey,
-            'Content-Type': 'application/json',
-            'accept': 'application/json',
-          },
-        }
-      );
-
-      const { transactionId, qrCode, deepLink } = apiResponse.data;
-
-      if (!transactionId || !qrCode || !deepLink) {
-        throw new Error('Sandbox API 回傳資料不完整');
-      }
-
-      // --- 12: 記錄 IssuanceLogs ---
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); 
-      await tx.issuanceLog.create({
-        data: { transactionId, status: IssuanceLogStatus.initiated, expiresAt, issuedVcId: newIssuedVC.id },
-      });
-
-      return { qrCode, deepLink, transactionId };
+    // 3. 建立 IssuedVC 紀錄
+    const newIssuedVC = await tx.issuedVC.create({
+      data: {
+        systemUuid,
+        personId,
+        templateId,
+        status: IssuanceStatus.issuing,
+        issuedData,
+        benefitLevel,
+      },
     });
 
-    // --- Step 13: 回傳結果給 FE ---
-    return res.status(200).json(transactionResult);
+    // 4. 呼叫 Sandbox API
+    const payload = buildIssuancePayload(template.vcUid, issuedData);
+    const { transactionId, qrCode, deepLink } = await callSandboxIssue(
+      apiBase,
+      apiKey,
+      payload
+    );
 
+    // 5. 建立 IssuanceLog
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await tx.issuanceLog.create({
+      data: {
+        transactionId,
+        status: IssuanceLogStatus.initiated,
+        expiresAt,
+        issuedVcId: newIssuedVC.id,
+      },
+    });
+
+    return { transactionId, qrCode, deepLink };
+  });
+}
+
+function handleRequestCredentialError(err: unknown, res: Response) {
+
+  if (err instanceof IssuanceError) {
+    switch (err.code) {
+      case 'UNAUTHORIZED':
+        return res.status(401).json({ message: err.message });
+      case 'INVALID_TEMPLATE_ID':
+        return res.status(400).json({ message: err.message });
+      case 'ENV_MISSING':
+        return res.status(500).json({ message: err.message });
+      case 'PERSON_NOT_FOUND':
+        return res
+          .status(404)
+          .json({ message: '找不到對應的使用者資料' });
+      case 'TEMPLATE_NOT_FOUND':
+        return res
+          .status(404)
+          .json({ message: '找不到對應的 VC 模板' });
+      case 'VCUID_MISSING':
+        return res
+          .status(400)
+          .json({ message: 'VC 模板設定不完整 (缺少 vcUid)' });
+      case 'SANDBOX_INCOMPLETE':
+        return res
+          .status(502)
+          .json({ message: 'Sandbox API 回傳資料不完整' });
+    }
+  }
+
+  if (axios.isAxiosError(err)) {
+    return res.status(502).json({
+      message: '呼叫 Sandbox API 失敗',
+      error: err.response?.data,
+    });
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    return res.status(500).json({
+      message: '資料庫操作失敗',
+      code: err.code,
+    });
+  }
+
+  return res.status(500).json({ message: '伺服器內部錯誤' });
+}
+
+/** ==== 路由 handler 本體（被大幅瘦身）==== */
+
+router.post('/request-credential', async (req: Request, res: Response) => {
+  try {
+    console.log('[request-credential] 請求開始。');
+    console.log(
+      '[request-credential] 收到的 headers.cookie:',
+      req.headers.cookie
+    );
+    console.log(
+      '[request-credential] 收到的 session 物件:',
+      JSON.stringify(req.session)
+    );
+
+    const ids = extractIdsFromRequest(req);
+    const env = getWalletEnv();
+
+    const result = await runIssuanceTransaction({
+      ...ids,
+      ...env,
+    });
+
+    return res.status(200).json(result);
   } catch (err) {
-    // ... (錯誤處理邏輯不變) ...
-    console.error('[Issuer BE] /api/issuance/request-credential error:', err);
-    if (err instanceof Error) {
-      if (err.message === 'Person not found') {
-        return res.status(404).json({ message: '找不到對應的使用者資料' });
-      }
-      if (err.message === 'Template not found') {
-        return res.status(404).json({ message: '找不到對應的 VC 模板' });
-      }
-      if (err.message === 'Template vcUid is missing') {
-        return res.status(400).json({ message: 'VC 模板設定不完整 (缺少 vcUid)' });
-      }
-    }
-    if (axios.isAxiosError(err)) {
-      console.error('Sandbox API Error:', err.response?.data || err.message);
-      return res.status(502).json({ 
-        message: '呼叫 Sandbox API 失敗', 
-        error: err.response?.data 
-      });
-    }
-    return res.status(500).json({ message: '伺服器內部錯誤' });
+    return handleRequestCredentialError(err, res);
   }
 });
-
 
 /**
  * @route   GET /api/issuance/status/:transactionId
  * @desc    (Step 15-18) FE 輪詢此 API 檢查 VC 領取狀態 (更新版)
  * @param   {string} transactionId - 要查詢的交易 ID
  */
-router.get('/status/:transactionId', async (req, res) => {
-  // 1. 驗證 Session (安全性)
-  const personIdStr = req.session.personId;
+class StatusRouteError extends Error {
+  constructor(
+    public code:
+      | 'UNAUTHORIZED'
+      | 'MISSING_TRANSACTION_ID'
+      | 'NOT_FOUND'
+      | 'ENV_MISSING'
+      | 'NO_CREDENTIAL'
+      | 'INVALID_JWT'
+      | 'NO_CID',
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+function getPersonIdFromSession(req: any): bigint {
+  const personIdStr = req.session?.personId;
   if (!personIdStr) {
-    return res.status(401).json({ message: 'Session 遺失，請重新操作' });
-  }
-  const personId = BigInt(personIdStr);
-
-  // ⭐️ [變更點] ⭐️ 從 URL 取得 transactionId
-  const { transactionId } = req.params;
-  if (!transactionId) {
-    return res.status(400).json({ message: '未提供 transactionId' });
-  }
-
-  try {
-    // 2. ⭐️ [變更點] ⭐️ 精確查找 Log，並驗證 personId 確保安全
-    const activeLog = await prisma.issuanceLog.findUnique({
-      where: {
-        transactionId: transactionId,
-        // 確保這個 Log 屬於當前 Session 的 personId
-        issuedVC: {
-          personId: personId,
-        },
-      },
-      include: {
-        issuedVC: true,
-      },
-    });
-
-    // 3. 檢查 Log 是否存在
-    if (!activeLog) {
-      return res.status(404).json({ message: '找不到此簽發流程，或您無權查詢' });
-    }
-
-    // 4. 檢查是否已是「最終狀態」
-    if (activeLog.status === IssuanceLogStatus.user_claimed) {
-      return res.status(200).json({ status: 'issued', message: '已領取成功' });
-    }
-    if (activeLog.status === IssuanceLogStatus.expired) {
-      return res.status(200).json({ status: 'expired', message: '簽發流程已過期' });
-    }
-    
-    // (到這裡，狀態必定是 'initiated')
-
-    // 5. (Step 18) 檢查是否已過期
-    if (activeLog.expiresAt && new Date() > activeLog.expiresAt) {
-      await prisma.$transaction([
-        prisma.issuanceLog.update({
-          where: { id: activeLog.id },
-          data: { status: IssuanceLogStatus.expired },
-        }),
-        prisma.issuedVC.update({
-          where: { id: activeLog.issuedVC.id },
-          data: { status: IssuanceStatus.expired },
-        }),
-      ]);
-      return res.status(200).json({ status: 'expired', message: '簽發流程已過期' });
-    }
-
-    // 6. (Step 15) 呼叫 Sandbox API 檢查憑證狀態
-    const apiBase = process.env.WALLET_API_BASE;
-    const apiKey = process.env.WALLET_API_KEY;
-
-    if (!apiBase || !apiKey) {
-      return res.status(500).json({ message: '伺服器環境變數設定不完整' });
-    }
-
-    // ⭐️ [變更點] ⭐️ 使用 URL 傳入的 transactionId 查詢
-    const apiResponse = await axios.get(
-      `${apiBase}/api/credential/nonce/${transactionId}`,
-      {
-        headers: {
-          'Access-Token': apiKey,
-          'accept': '*/*',
-        },
-      }
+    throw new StatusRouteError(
+      'UNAUTHORIZED',
+      'Session 遺失，請重新操作'
     );
+  }
+  return BigInt(personIdStr);
+}
 
-    // 7. (Step 16-17) 輪詢成功！使用者已領取
-    const credentialJWT = apiResponse.data.credential;
-    if (!credentialJWT) {
-      throw new Error('Sandbox API 回傳 200 OK 但缺少 credential');
-    }
+function getTransactionIdFromParams(req: any): string {
+  const { transactionId } = req.params as { transactionId?: string };
+  if (!transactionId) {
+    throw new StatusRouteError(
+      'MISSING_TRANSACTION_ID',
+      '未提供 transactionId'
+    );
+  }
+  return transactionId;
+}
 
-    const decoded = jwtDecode(credentialJWT);
-    if (!decoded || typeof decoded !== 'object' || !decoded.jti) {
-      throw new Error('解析 JWT 失敗或缺少 jti');
-    }
+async function findActiveIssuanceLog(personId: bigint, transactionId: string) {
+  const activeLog = await prisma.issuanceLog.findUnique({
+    where: {
+      transactionId: transactionId,
+      issuedVC: {
+        personId: personId,
+      },
+    },
+    include: {
+      issuedVC: true,
+    },
+  });
 
-    const jti = decoded.jti as string;
-    const cid = jti.split('credential/').pop();
+  if (!activeLog) {
+    throw new StatusRouteError(
+      'NOT_FOUND',
+      '找不到此簽發流程，或您無權查詢'
+    );
+  }
 
-    if (!cid) {
-      throw new Error('無法從 jti 解析出 CID');
-    }
+  return activeLog;
+}
 
-    // 更新資料庫
+function getFinalStatusResponse(activeLog: any):
+  | { status: 'issued' | 'expired'; message: string }
+  | null {
+  if (activeLog.status === IssuanceLogStatus.user_claimed) {
+    return { status: 'issued', message: '已領取成功' };
+  }
+  if (activeLog.status === IssuanceLogStatus.expired) {
+    return { status: 'expired', message: '簽發流程已過期' };
+  }
+  return null;
+}
+
+async function handleExpiryIfNeeded(activeLog: any): Promise<boolean> {
+  if (activeLog.expiresAt && new Date() > activeLog.expiresAt) {
     await prisma.$transaction([
       prisma.issuanceLog.update({
         where: { id: activeLog.id },
-        data: { status: IssuanceLogStatus.user_claimed },
+        data: { status: IssuanceLogStatus.expired },
       }),
       prisma.issuedVC.update({
         where: { id: activeLog.issuedVC.id },
-        data: {
-          status: IssuanceStatus.issued,
-          cid: cid,
-          issuedAt: new Date(),
-        },
+        data: { status: IssuanceStatus.expired },
       }),
     ]);
+    return true;
+  }
+  return false;
+}
 
-    return res.status(200).json({ status: 'issued', message: '領取成功' });
+function getWalletEnvForStatus() {
+  const apiBase = process.env.WALLET_API_BASE;
+  const apiKey = process.env.WALLET_API_KEY;
 
-  } catch (err) {
-    // 8. (Step 15 繼續) 處理 Sandbox API 的錯誤
-    if (axios.isAxiosError(err)) {
-      if (err.response?.data?.code === '61010') {
-        return res.status(200).json({ status: 'initiated', message: '使用者尚未領取' });
-      }
-      console.error('Sandbox API Error:', err.response?.data || err.message);
-      return res.status(502).json({ 
-        message: 'Sandbox API 查詢失敗', 
-        error: err.response?.data 
+  if (!apiBase || !apiKey) {
+    throw new StatusRouteError(
+      'ENV_MISSING',
+      '伺服器環境變數設定不完整'
+    );
+  }
+
+  return { apiBase, apiKey };
+}
+
+function decodeCidFromCredential(credentialJWT: string): string {
+  const decoded = jwtDecode(credentialJWT);
+  if (!decoded || typeof decoded !== 'object' || !(decoded as any).jti) {
+    throw new StatusRouteError(
+      'INVALID_JWT',
+      '解析 JWT 失敗或缺少 jti'
+    );
+  }
+
+  const jti = (decoded as any).jti as string;
+  const cid = jti.split('credential/').pop();
+
+  if (!cid) {
+    throw new StatusRouteError(
+      'NO_CID',
+      '無法從 jti 解析出 CID'
+    );
+  }
+
+  return cid;
+}
+
+async function checkSandboxAndUpdateStatus(
+  transactionId: string,
+  activeLog: any
+): Promise<{ status: 'issued'; message: string }> {
+  const { apiBase, apiKey } = getWalletEnvForStatus();
+
+  const apiResponse = await axios.get(
+    `${apiBase}/api/credential/nonce/${transactionId}`,
+    {
+      headers: {
+        'Access-Token': apiKey,
+        accept: '*/*',
+      },
+    }
+  );
+
+  const credentialJWT = apiResponse.data?.credential;
+  if (!credentialJWT) {
+    throw new StatusRouteError(
+      'NO_CREDENTIAL',
+      'Sandbox API 回傳 200 OK 但缺少 credential'
+    );
+  }
+
+  const cid = decodeCidFromCredential(credentialJWT);
+
+  await prisma.$transaction([
+    prisma.issuanceLog.update({
+      where: { id: activeLog.id },
+      data: { status: IssuanceLogStatus.user_claimed },
+    }),
+    prisma.issuedVC.update({
+      where: { id: activeLog.issuedVC.id },
+      data: {
+        status: IssuanceStatus.issued,
+        cid: cid,
+        issuedAt: new Date(),
+      },
+    }),
+  ]);
+
+  return { status: 'issued', message: '領取成功' };
+}
+
+function handleStatusRouteError(err: unknown, req: any, res: Response) {
+  if (err instanceof StatusRouteError) {
+    const statusMap: Record<StatusRouteError['code'], number> = {
+      UNAUTHORIZED: 401,
+      MISSING_TRANSACTION_ID: 400,
+      NOT_FOUND: 404,
+      ENV_MISSING: 500,
+      NO_CREDENTIAL: 502,
+      INVALID_JWT: 500,
+      NO_CID: 500,
+    };
+
+    return res
+      .status(statusMap[err.code])
+      .json({ message: err.message });
+  }
+
+  if (axios.isAxiosError(err)) {
+    if (err.response?.data?.code === '61010') {
+      // 使用者尚未領取
+      return res.status(200).json({
+        status: 'initiated',
+        message: '使用者尚未領取',
       });
     }
 
-    // 9. 其他內部錯誤
-    console.error(`[Issuer BE] /api/issuance/status/${transactionId} error:`, err);
-    return res.status(500).json({ 
-      message: '伺服器內部錯誤', 
-      error: err instanceof Error ? err.message : String(err) 
+    return res.status(502).json({
+      message: 'Sandbox API 查詢失敗',
+      error: err.response?.data,
     });
   }
-});
 
+  return res.status(500).json({
+    message: '伺服器內部錯誤',
+    error: err instanceof Error ? err.message : String(err),
+  });
+}
+
+/** ========= 路由本體（大幅瘦身） ========= */
+
+router.get('/status/:transactionId', async (req: any, res: Response) => {
+  try {
+    const personId = getPersonIdFromSession(req);
+    const transactionId = getTransactionIdFromParams(req);
+
+    const activeLog = await findActiveIssuanceLog(personId, transactionId);
+
+    const finalStatus = getFinalStatusResponse(activeLog);
+    if (finalStatus) {
+      // 已是 issued / expired，不用再呼叫 Sandbox
+      return res.status(200).json(finalStatus);
+    }
+
+    const isExpired = await handleExpiryIfNeeded(activeLog);
+    if (isExpired) {
+      return res
+        .status(200)
+        .json({ status: 'expired', message: '簽發流程已過期' });
+    }
+
+    const result = await checkSandboxAndUpdateStatus(
+      transactionId,
+      activeLog
+    );
+    return res.status(200).json(result);
+  } catch (err) {
+    return handleStatusRouteError(err, req, res);
+  }
+});
 
 export default router;

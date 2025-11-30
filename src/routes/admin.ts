@@ -71,7 +71,6 @@ router.get('/templates/stats', async (req, res) => {
     return res.status(200).json(responseData);
 
   } catch (err) {
-    console.error('[Admin BE] /templates/stats error:', err);
     return res.status(500).json({ 
       message: '伺服器內部錯誤',
       error: err instanceof Error ? err.message : String(err)
@@ -89,161 +88,214 @@ router.get('/templates/stats', async (req, res) => {
  * ?limit=20
  * ?search=王大明
  */
-router.get('/templates/:templateId/persons', async (req, res) => {
-  try {
-    // --- 1. 解析 URL 參數和 Query ---
-    const templateId = parseInt(req.params.templateId);
-    if (isNaN(templateId)) {
-      return res.status(400).json({ message: '無效的 templateId' });
-    }
-
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 20;
-    const skip = (page - 1) * limit;
-    const search = req.query.search as string;
-
-    // --- 2. 建立動態 WHERE 條件 ---
-    let where: Prisma.PersonWhereInput = {
-      eligibilities: {
-        some: {
-          templateId: templateId,
-        },
-      },
-    };
-    if (search) {
-      where = {
-        AND: [
-          where,
-          {
-            OR: [
-              { name: { contains: search } },
-              { nationalId: { contains: search } },
-              { personalId: { contains: search } },
-            ],
-          },
-        ],
+type PersonWithIssuedVCs = Prisma.PersonGetPayload<{
+  include: {
+    issuedVCs: {
+      select: {
+        status: true;
       };
-    }
+    };
+  };
+}>;
 
-    // --- 3. 執行平行查詢 (Template 名稱, 總數, 當頁資料) ---
-    
-    // (查詢 1: 取得 Template 名稱)
-    const templatePromise = prisma.vCTemplate.findUnique({
-      where: { id: templateId },
-      select: { templateName: true },
-    });
-    
-    // (查詢 2: 取得總數)
-    const totalPersonsPromise = prisma.person.count({ where });
+type PersonResponseDto = {
+  personId: string;
+  name: string | null;
+  personalId: string | null;
+  nationalId: string | null;
+  county: string | null;
+  district: string | null;
+  address: string | null;
+  phoneNumber: string | null;
+  dateOfBirth: Date | null;
+  emergencyContactName: string | null;
+  emergencyContactRelationship: string | null;
+  emergencyContactPhone: string | null;
+  reviewingAuthority: string | null;
+  reviewerName: string | null;
+  reviewerPhone: string | null;
+  eligibilityStartDate: Date | null;
+  eligibilityEndDate: Date | null;
+  personalAnnualIncome: string | null;
+  personalMovableAssets: string | null;
+  personalRealEstateAssets: string | null;
+  familyAnnualIncome: string | null;
+  familyMovableAssets: string | null;
+  familyRealEstateAssets: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  issuedVc: { status: IssuanceStatus } | null;
+};
 
-    // (查詢 3: 取得當頁資料)
-    // [⭐️ 變更 ⭐️] 使用 'include' 抓取所有 Person 欄位
-    const personsPromise = prisma.person.findMany({
-      where,
-      include: {
-        // [⭐️ 變更 ⭐️] 僅 Select status，移除 issuedAt, benefitLevel
-        issuedVCs: {
-          where: {
-            templateId: templateId,
-          },
-          select: {
-            status: true,
-          },
-        },
+function parseTemplateId(param: string): number | null {
+  const templateId = parseInt(param, 10);
+  return isNaN(templateId) ? null : templateId;
+}
+
+function getPaginationParams(query: any) {
+  const page = parseInt(query.page as string, 10) || 1;
+  const limit = parseInt(query.limit as string, 10) || 20;
+  const skip = (page - 1) * limit;
+  const search = query.search as string | undefined;
+
+  return { page, limit, skip, search };
+}
+
+function buildPersonWhere(
+  templateId: number,
+  search?: string
+): Prisma.PersonWhereInput {
+  const baseWhere: Prisma.PersonWhereInput = {
+    eligibilities: {
+      some: { templateId },
+    },
+  };
+
+  if (!search) {
+    return baseWhere;
+  }
+
+  return {
+    AND: [
+      baseWhere,
+      {
+        OR: [
+          { name: { contains: search } },
+          { nationalId: { contains: search } },
+          { personalId: { contains: search } },
+        ],
       },
-      take: limit,
-      skip: skip,
-      orderBy: { name: 'asc' },
-    });
+    ],
+  };
+}
 
-    const [template, totalPersons, persons] = await Promise.all([
-      templatePromise,
-      totalPersonsPromise,
-      personsPromise,
-    ]);
+function selectDisplayedVc(
+  issuedVCs: { status: IssuanceStatus }[]
+): { status: IssuanceStatus } | null {
+  if (!issuedVCs.length) {
+    return null;
+  }
 
-    if (!template) {
-      return res.status(404).json({ message: '找不到指定的 Template' });
-    }
+  const preferred =
+    issuedVCs.find(
+      (vc) =>
+        vc.status === IssuanceStatus.issued ||
+        vc.status === IssuanceStatus.issuing
+    ) ?? issuedVCs[0];
 
-    // --- 4. 資料格式轉換 (符合 FE 要求的格式) ---
-    const data = persons.map(person => {
-      let displayedVc = null;
+  return { status: preferred.status };
+}
 
-      if (person.issuedVCs.length > 0) {
-        const vc = person.issuedVCs.find(vc => 
-          vc.status === IssuanceStatus.issued || vc.status === IssuanceStatus.issuing
-        ) || person.issuedVCs[0];
-        
-        // [⭐️ 變更 ⭐️] issuedVc 物件現在非常簡潔
-        displayedVc = { 
-          status: vc.status 
-        };
+function mapPersonToResponse(person: PersonWithIssuedVCs): PersonResponseDto {
+  const { issuedVCs, ...personData } = person;
+
+  return {
+    personId: personData.id.toString(),
+    name: personData.name,
+    personalId: personData.personalId,
+    nationalId: personData.nationalId,
+    county: personData.county,
+    district: personData.district,
+    address: personData.address,
+    phoneNumber: personData.phoneNumber,
+    dateOfBirth: personData.dateOfBirth,
+    emergencyContactName: personData.emergencyContactName,
+    emergencyContactRelationship: personData.emergencyContactRelationship,
+    emergencyContactPhone: personData.emergencyContactPhone,
+    reviewingAuthority: personData.reviewingAuthority,
+    reviewerName: personData.reviewerName,
+    reviewerPhone: personData.reviewerPhone,
+    eligibilityStartDate: personData.eligibilityStartDate,
+    eligibilityEndDate: personData.eligibilityEndDate,
+    personalAnnualIncome:
+      personData.personalAnnualIncome?.toString() ?? null,
+    personalMovableAssets:
+      personData.personalMovableAssets?.toString() ?? null,
+    personalRealEstateAssets:
+      personData.personalRealEstateAssets?.toString() ?? null,
+    familyAnnualIncome: personData.familyAnnualIncome?.toString() ?? null,
+    familyMovableAssets:
+      personData.familyMovableAssets?.toString() ?? null,
+    familyRealEstateAssets:
+      personData.familyRealEstateAssets?.toString() ?? null,
+    createdAt: personData.createdAt,
+    updatedAt: personData.updatedAt,
+    issuedVc: selectDisplayedVc(issuedVCs),
+  };
+}
+
+function buildPagination(page: number, limit: number, total: number) {
+  const totalPages = Math.ceil(total / limit);
+  return {
+    total,
+    totalPages,
+    currentPage: page,
+    limit,
+  };
+}
+
+function handleAdminRouteError(
+  err: unknown,
+  req: Request,
+  res: Response
+): Response {
+
+  return res.status(500).json({
+    message: '伺服器內部錯誤',
+    error: err instanceof Error ? err.message : String(err),
+  });
+}
+router.get(
+  '/templates/:templateId/persons',
+  async (req: Request, res: Response) => {
+    try {
+      const templateId = parseTemplateId(req.params.templateId);
+      if (templateId === null) {
+        return res.status(400).json({ message: '無效的 templateId' });
       }
 
-      // (移除 'issuedVCs' 輔助欄位，避免回傳)
-      const { issuedVCs, ...personData } = person;
+      const { page, limit, skip, search } = getPaginationParams(req.query);
+      const where = buildPersonWhere(templateId, search);
 
-      // [⭐️ 變更 ⭐️] 手動組合回傳物件，確保 BigInt 欄位被轉為 String
-      return {
-        // (Person 的所有欄位)
-        personId: personData.id.toString(), // 覆蓋 BigInt
-        name: personData.name,
-        personalId: personData.personalId,
-        nationalId: personData.nationalId,
-        county: personData.county,
-        district: personData.district,
-        address: personData.address,
-        phoneNumber: personData.phoneNumber,
-        dateOfBirth: personData.dateOfBirth,
-        emergencyContactName: personData.emergencyContactName,
-        emergencyContactRelationship: personData.emergencyContactRelationship,
-        emergencyContactPhone: personData.emergencyContactPhone,
-        reviewingAuthority: personData.reviewingAuthority,
-        reviewerName: personData.reviewerName,
-        reviewerPhone: personData.reviewerPhone,
-        eligibilityStartDate: personData.eligibilityStartDate,
-        eligibilityEndDate: personData.eligibilityEndDate,
-        // (BigInt 財產欄位 -> String)
-        personalAnnualIncome: personData.personalAnnualIncome?.toString() || null,
-        personalMovableAssets: personData.personalMovableAssets?.toString() || null,
-        personalRealEstateAssets: personData.personalRealEstateAssets?.toString() || null,
-        familyAnnualIncome: personData.familyAnnualIncome?.toString() || null,
-        familyMovableAssets: personData.familyMovableAssets?.toString() || null,
-        familyRealEstateAssets: personData.familyRealEstateAssets?.toString() || null,
-        createdAt: personData.createdAt,
-        updatedAt: personData.updatedAt,
-        
-        // (VC 狀態)
-        issuedVc: displayedVc
-      };
-    });
+      const [template, totalPersons, persons] = await Promise.all([
+        prisma.vCTemplate.findUnique({
+          where: { id: templateId },
+          select: { templateName: true },
+        }),
+        prisma.person.count({ where }),
+        prisma.person.findMany({
+          where,
+          include: {
+            issuedVCs: {
+              where: { templateId },
+              select: { status: true },
+            },
+          },
+          take: limit,
+          skip,
+          orderBy: { name: 'asc' },
+        }),
+      ]);
 
-    // --- 5. 建立分頁物件 ---
-    const totalPages = Math.ceil(totalPersons / limit);
-    const pagination = {
-      total: totalPersons,
-      totalPages: totalPages,
-      currentPage: page,
-      limit: limit,
-    };
+      if (!template) {
+        return res
+          .status(404)
+          .json({ message: '找不到指定的 Template' });
+      }
 
-    // --- 6. 回傳最終結果 ---
-    // [⭐️ 變更 ⭐️] 在最頂層回傳 templateName
-    return res.status(200).json({
-      templateName: template.templateName,
-      pagination,
-      data,
-    });
+      const data = persons.map(mapPersonToResponse);
+      const pagination = buildPagination(page, limit, totalPersons);
 
-  } catch (err) {
-    console.error(`[Admin BE] /templates/${req.params.templateId}/persons error:`, err);
-    return res.status(500).json({ 
-      message: '伺服器內部錯誤',
-      error: err instanceof Error ? err.message : String(err)
-    });
+      return res.status(200).json({
+        templateName: template.templateName,
+        pagination,
+        data,
+      });
+    } catch (err) {
+      return handleAdminRouteError(err, req, res);
+    }
   }
-});
+);
 
 /**
  * [POST] /api/v1/admin/eligibility/revoke
@@ -252,10 +304,9 @@ router.get('/templates/:templateId/persons', async (req, res) => {
  * Body: { personId: string, templateId: number, reason: string }
  */
 router.post('/eligibility/revoke', async (req, res) => {
-  const { personId, templateId, reason } = req.body as {
+  const { personId, templateId } = req.body as {
     personId: string; // (來自 BE-2 的回傳，應為 string)
     templateId: number;
-    reason: string;
   };
 
   // --- 1. Validation ---
@@ -276,7 +327,6 @@ router.post('/eligibility/revoke', async (req, res) => {
   const apiKey = process.env.WALLET_API_KEY;
 
   if (!apiBase || !apiKey) {
-    console.error('[Admin BE] WALLET_API .env variables not set');
     return res.status(500).json({ message: '伺服器設定錯誤 (Wallet API Key)' });
   }
 
@@ -342,15 +392,6 @@ router.post('/eligibility/revoke', async (req, res) => {
         }
       });
 
-      // (TODO: 建議的 Step 5 - 寫入 AdminAuditLog)
-      // await tx.adminAuditLog.create({ 
-      //   data: { 
-      //     action: 'revoke_eligibility', 
-      //     targetPersonId: personIdBigInt, 
-      //     targetTemplateId: templateId, 
-      //     reason: reason 
-      //   } 
-      // });
     });
 
     // --- 3. Transaction 成功 ---
@@ -358,7 +399,6 @@ router.post('/eligibility/revoke', async (req, res) => {
 
   } catch (err) {
     // --- 4. Transaction 失敗 ---
-    console.error(`[Admin BE] /eligibility/revoke Transaction error:`, err);
 
     // (Case 1: Sandbox API 呼叫失敗)
     if (axios.isAxiosError(err)) {
@@ -494,7 +534,6 @@ router.get('/logs/issuance', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[Admin BE] /logs/issuance error:', err);
     return res.status(500).json({ 
       message: '伺服器內部錯誤',
       error: err instanceof Error ? err.message : String(err)
@@ -661,7 +700,6 @@ router.get('/logs/verification', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[Admin BE] /logs/verification error:', err);
     return res.status(500).json({ 
       message: '伺服器內部錯誤',
       error: err instanceof Error ? err.message : String(err)
