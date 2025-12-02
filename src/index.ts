@@ -2,6 +2,8 @@ import express from 'express';
 import session from 'express-session';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
+import fs from 'fs';
+import https from 'https';
 
 // [FIX 2] 修正模組匯入路徑，加上 .js 副檔名
 // 並且假設您的 tsconfig.json 會自動讀取 src/types/session.d.ts 中的型別
@@ -76,8 +78,25 @@ app.use('/api/v1/admin', adminRoutes);
 
 // --- 啟動伺服器 ---
 
-// [FIX 2] 監聽 0.0.0.0
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Express 伺服器已啟動於 http://0.0.0.0:${PORT}`);
-  console.log(`   (本機也可透過 http://localhost:${PORT} 存取)`);
-});
+if (process.env.NODE_ENV === 'production') {
+  const keyPath = process.env.TLS_KEY_PATH;
+  const certPath = process.env.TLS_CERT_PATH;
+
+  if (!keyPath || !certPath) {
+    throw new Error('TLS_KEY_PATH 與 TLS_CERT_PATH 在 production 環境必須設定');
+  }
+
+  const key = fs.readFileSync(keyPath);
+  const cert = fs.readFileSync(certPath);
+
+  https.createServer({ key, cert }, app).listen(PORT, '0.0.0.0', () => {
+    // 避免在日誌中輸出內部連線位址與埠號，以降低 System Information Leak: Internal 風險
+    console.log('🚀 HTTPS 伺服器已啟動');
+  });
+} else {
+  // 開發環境可使用 HTTP，方便本機除錯
+  app.listen(PORT, '0.0.0.0', () => {
+    // 避免在日誌中輸出內部連線位址與埠號，以降低 System Information Leak: Internal 風險
+    console.log('🚀 開發環境 HTTP 伺服器已啟動');
+  });
+}

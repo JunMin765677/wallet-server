@@ -5,6 +5,7 @@ import { IssuanceStatus, IssuanceLogStatus } from '@prisma/client';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { decode as jwtDecode } from 'jsonwebtoken';
+import { randomInt } from 'crypto';
 
 // ⭐️ [新增] ⭐️ 用於隨機生成 Benefit Level 的輔助函式
 const benefitLevelMap: Record<number, string[]> = {
@@ -25,7 +26,8 @@ const benefitLevelMap: Record<number, string[]> = {
  */
 function getRandomItem<T>(items: T[]): T | undefined {
   if (!items || items.length === 0) return undefined;
-  return items[Math.floor(Math.random() * items.length)];
+  const index = randomInt(items.length);
+  return items[index];
 }
 
 /**
@@ -78,8 +80,8 @@ router.post('/start-simulation', async (req, res) => {
       });
     }
 
-    // C. 隨機選取
-    const selected = candidates[Math.floor(Math.random() * candidates.length)];
+    // C. 隨機選取（使用 crypto.randomInt 取代 Math.random）
+    const selected = candidates[randomInt(candidates.length)];
     const personId = selected.id;
 
     // D. 將 personId 存入 session

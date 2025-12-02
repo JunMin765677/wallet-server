@@ -1,4 +1,3 @@
-
 -----
 
 # 數位憑證 (VC) 模擬平台 - 後端 API
@@ -66,18 +65,18 @@
 ```ini
 # 1. 資料庫連線 (Prisma)
 # 格式: mysql://[使用者]:[密碼]@[主機]:[埠號]/[資料庫名稱]
-DATABASE_URL="mysql://root:password@localhost:3306/wallet_db"
+DATABASE_URL="mysql://<DB_USER>:<DB_PASSWORD>@localhost:3306/wallet_db"
 
 # 2. Express Session 密鑰 (隨機字串)
-SESSION_SECRET="YOUR_VERY_STRONG_SESSION_SECRET"
+SESSION_SECRET="<RANDOM_SECRET_STRING>"
 
 # 3. 簽發 (Issuance) Sandbox API (Part 1)
 WALLET_API_BASE="[https://issuer-sandbox.wallet.gov.tw](https://issuer-sandbox.wallet.gov.tw)"
-WALLET_API_KEY="YOUR_WALLET_API_KEY"
+WALLET_API_KEY="<ISSUER_WALLET_API_KEY>"
 
 # 4. 驗證 (Verification) Sandbox API (Part 2)
 VERIFIER_API_BASE="[https://verifier-oid4vp.wallet.gov.tw](https://verifier-oid4vp.wallet.gov.tw)"
-VERIFIER_API_KEY="YOUR_VERIFIER_API_KEY"
+VERIFIER_API_KEY="<VERIFIER_API_KEY>"
 
 # 5. 本機 App 基礎 URL (用於批次驗證 QR Code)
 # (開發時使用 localhost，部署時必須改為您後端的公開 URL)
