@@ -171,5 +171,9 @@ APP_BASE_URL="http://localhost:3000"
 
 <!-- end list -->
 
+
+### 授權
+
+本專案採用 MIT 開源授權，詳細條款請見 LICENSE。
 ```
 ```
