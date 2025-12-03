@@ -2,8 +2,6 @@ import express from 'express';
 import session from 'express-session';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
-import fs from 'fs';
-import https from 'https';
 
 // [FIX 2] 修正模組匯入路徑，加上 .js 副檔名
 // 並且假設您的 tsconfig.json 會自動讀取 src/types/session.d.ts 中的型別
@@ -73,29 +71,3 @@ app.use(
 app.use('/api/issuance', issuanceRoutes);
 app.use('/api/verification', verificationRoutes);
 app.use('/api/v1/admin', adminRoutes);
-
-// --- 啟動伺服器 ---
-//
-// 為了避免 Fortify 報告 Insecure Transport / Path Manipulation，
-// 這裡示範性地使用固定的 TLS 憑證路徑與嚴格的 TLS 設定。
-// 實際部署時請依照環境自行調整憑證路徑。
-
-const TLS_KEY_PATH = '/etc/wallet-server/tls/server-key.pem';
-const TLS_CERT_PATH = '/etc/wallet-server/tls/server-cert.pem';
-
-const key = fs.readFileSync(TLS_KEY_PATH);
-const cert = fs.readFileSync(TLS_CERT_PATH);
-
-https.createServer(
-  {
-    key,
-    cert,
-    // 強制使用安全協定版本，避免 Weak SSL Protocol
-    minVersion: 'TLSv1.2',
-    secureProtocol: 'TLSv1_2_method',
-  },
-  app
-).listen(PORT, '0.0.0.0', () => {
-  // 避免在日誌中輸出內部連線位址與埠號，以降低 System Information Leak: Internal 風險
-  console.log('🚀 HTTPS 伺服器已啟動');
-});
